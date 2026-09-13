@@ -641,7 +641,7 @@ public:
                       upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
                   {
                      auto* sr_instance_data = device_data.GetSRInstanceData();
-                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type];
+                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type].get();
                      if (sr_instance_data && sr_impl)
                      {
                         SR::SettingsData settings_data;

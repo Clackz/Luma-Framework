@@ -905,158 +905,28 @@ public:
             native_device_context->RSGetViewports(&num_viewports, &viewport);
             // game_device_data.viewport_rect         = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height};
             // game_device_data.render_resolution     = {(float)taa_output_texture_desc.Width, (float)taa_output_texture_desc.Height, 1.0f / (float)taa_output_texture_desc.Width, 1.0f / (float)taa_output_texture_desc.Height};
-            // --- DLSS true super-resolution: downscale the TAA source color ---
-            // D3D11 has no scaled copy API (StretchRect is D3D9 only), so use
-            // the framework's Luma_Scale VS/PS (full-screen triangle + bilinear
-            // sampling, same as the core's scaled copy path) to blit the game's
-            // full-resolution TAA source into a smaller RT, then feed that RT
-            // to DLSS so it performs a real 1.5x upsample instead of DLAA. The
-            // declared render size is only reduced when the blit actually
-            // succeeded, otherwise we fall back to DLAA (stock behavior).
+            // --- DLSS input: the game's TAA source color, native TAA resolution (DLAA) ---
+            // UE4 performs the ScreenPercentage upscale in a *later* pass, so the
+            // TAA slot exposed here is internal-res -> internal-res: replacing it
+            // can only yield DLAA. Downscaling the input to fake super-resolution
+            // (v4) was measured and discarded: no performance win (the game still
+            // shades at full internal res), worse image quality from the extra
+            // resample, and it corrupted the in-game UI on resolution changes.
             uint32_t sr_declared_render_w = taa_output_texture_desc.Width;
             uint32_t sr_declared_render_h = taa_output_texture_desc.Height;
             game_device_data.sr_source_color = nullptr;
             shader_resources[taa_shader_info.source_texture_register]->GetResource(&game_device_data.sr_source_color);
-            {
-               com_ptr<ID3D11Texture2D> source_color_texture;
-               if (game_device_data.sr_source_color.get() && SUCCEEDED(game_device_data.sr_source_color->QueryInterface(&source_color_texture)) && source_color_texture.get())
-               {
-                  D3D11_TEXTURE2D_DESC source_color_texture_desc;
-                  source_color_texture->GetDesc(&source_color_texture_desc);
-                  const uint32_t target_w = (uint32_t)(source_color_texture_desc.Width / 1.5f); // DLSS Quality
-                  const uint32_t target_h = (uint32_t)(source_color_texture_desc.Height / 1.5f);
-                  com_ptr<ID3D11VertexShader> vs_scale = device_data.native_vertex_shaders[CompileTimeStringHash("Scale VS")];
-                  com_ptr<ID3D11PixelShader> ps_scale = device_data.native_pixel_shaders[CompileTimeStringHash("Scale PS")];
-                  if (vs_scale.get() && ps_scale.get() &&
-                      target_w >= 64 && target_h >= 64 &&
-                      target_w < source_color_texture_desc.Width && target_h < source_color_texture_desc.Height &&
-                      source_color_texture_desc.SampleDesc.Count <= 1 &&
-                      std::fabs((float)source_color_texture_desc.Width / (float)source_color_texture_desc.Height - (float)target_w / (float)target_h) < 0.01f)
-                  {
-                     // Cached for the whole run, recreated only when the target size or format changes.
-                     static com_ptr<ID3D11Texture2D> scaled_rt;
-                     static com_ptr<ID3D11RenderTargetView> scaled_rt_rtv;
-                     static uint32_t scaled_w = 0;
-                     static uint32_t scaled_h = 0;
-                     static DXGI_FORMAT scaled_format = DXGI_FORMAT_UNKNOWN;
-                     if (!scaled_rt.get() || scaled_w != target_w || scaled_h != target_h || scaled_format != source_color_texture_desc.Format)
-                     {
-                        scaled_rt = nullptr;
-                        scaled_rt_rtv = nullptr;
-                        scaled_w = 0;
-                        scaled_h = 0;
-                        scaled_format = DXGI_FORMAT_UNKNOWN;
-                        D3D11_TEXTURE2D_DESC scaled_rt_desc = source_color_texture_desc;
-                        scaled_rt_desc.Width = target_w;
-                        scaled_rt_desc.Height = target_h;
-                        scaled_rt_desc.MipLevels = 1;
-                        scaled_rt_desc.ArraySize = 1;
-                        scaled_rt_desc.SampleDesc = { 1, 0 };
-                        scaled_rt_desc.Usage = D3D11_USAGE_DEFAULT;
-                        scaled_rt_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                        scaled_rt_desc.CPUAccessFlags = 0;
-                        scaled_rt_desc.MiscFlags = 0;
-                        HRESULT hr_create = native_device->CreateTexture2D(&scaled_rt_desc, nullptr, &scaled_rt);
-                        ASSERT_ONCE(SUCCEEDED(hr_create));
-                        if (SUCCEEDED(hr_create))
-                        {
-                           D3D11_RENDER_TARGET_VIEW_DESC scaled_rt_rtv_desc;
-                           scaled_rt_rtv_desc.Format = scaled_rt_desc.Format;
-                           // Redirect typeless formats to concrete ones for the view
-                           switch (scaled_rt_rtv_desc.Format)
-                           {
-                           case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-                              scaled_rt_rtv_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-                              break;
-                           case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-                           case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-                              scaled_rt_rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                              break;
-                           case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-                           case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-                              scaled_rt_rtv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                              break;
-                           case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-                              scaled_rt_rtv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                              break;
-                           }
-                           scaled_rt_rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                           scaled_rt_rtv_desc.Texture2D.MipSlice = 0;
-                           hr_create = native_device->CreateRenderTargetView(scaled_rt.get(), &scaled_rt_rtv_desc, &scaled_rt_rtv);
-                           ASSERT_ONCE(SUCCEEDED(hr_create));
-                           if (SUCCEEDED(hr_create))
-                           {
-                              scaled_w = target_w;
-                              scaled_h = target_h;
-                              scaled_format = scaled_rt_desc.Format;
-                           }
-                        }
-                     }
-                     if (scaled_rt.get() && scaled_rt_rtv.get())
-                     {
-                        D3D11_SHADER_RESOURCE_VIEW_DESC source_color_srv_desc;
-                        source_color_srv_desc.Format = source_color_texture_desc.Format;
-                        // Redirect typeless formats to concrete ones for the view
-                        switch (source_color_srv_desc.Format)
-                        {
-                        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-                           source_color_srv_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-                           break;
-                        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-                        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-                           source_color_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                           break;
-                        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-                        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-                           source_color_srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                           break;
-                        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-                           source_color_srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                           break;
-                        }
-                        source_color_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                        source_color_srv_desc.Texture2D.MipLevels = 1;
-                        source_color_srv_desc.Texture2D.MostDetailedMip = 0;
-                        com_ptr<ID3D11ShaderResourceView> source_color_srv;
-                        if (SUCCEEDED(native_device->CreateShaderResourceView(source_color_texture.get(), &source_color_srv_desc, &source_color_srv)) && source_color_srv.get())
-                        {
-                           // Full state cache/restore, exactly like the core's scaled copy path
-                           DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
-                           draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
-                           // Clear current render targets first: DX11 refuses SRV bindings that are also bound as RT
-                           native_device_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
-                           DrawCustomPixelShader(
-                              native_device_context,
-                              device_data.default_depth_stencil_state.get(),
-                              device_data.default_blend_state.get(),
-                              device_data.sampler_state_linear.get(),
-                              vs_scale.get(),
-                              ps_scale.get(),
-                              source_color_srv.get(),
-                              scaled_rt_rtv.get(),
-                              target_w,
-                              target_h,
-                              true);
-                           // Feed DLSS the downscaled RT (com_ptr::operator= from raw pointer AddRefs)
-                           game_device_data.sr_source_color = scaled_rt.get();
-                           sr_declared_render_w = target_w;
-                           sr_declared_render_h = target_h;
-                        }
-                     }
-                  }
-               }
-            }
-            // True super-resolution when the downscale blit above succeeded
-            // (1.5x / DLSS Quality), otherwise DLAA (stock behavior). This
-            // value is only used for the overlay readout.
-            device_data.sr_render_resolution_scale = (sr_declared_render_w != taa_output_texture_desc.Width) ? (1.0f / 1.5f) : 1.0f;
+            // DLAA: the declared render size equals the TAA resolution. The
+            // value below is only used for the overlay readout.
+            device_data.sr_render_resolution_scale = 1.0f;
 
             SR::SettingsData settings_data;
             settings_data.output_width = taa_output_texture_desc.Width;
             settings_data.output_height = taa_output_texture_desc.Height;
-            // Declared render size: the downscaled blit target when the blit
-            // above succeeded (true super-resolution, DLSS Quality), otherwise
-            // the full TAA resolution (DLAA fallback, stock generic behavior).
+            // Declared render size = the actual DLSS input texture size (the
+            // game's TAA source color). This must match the real texture:
+            // declaring a larger size makes NGX return FAIL_InvalidParameter
+            // (BAD00005) every frame and the replaced pass stays black.
             settings_data.render_width = sr_declared_render_w;
             settings_data.render_height = sr_declared_render_h;
             settings_data.dynamic_resolution = true;
@@ -1066,8 +936,9 @@ public:
             settings_data.auto_exposure = sr_auto_exposure; // Unreal Engine does TAA before tonemapping
             settings_data.render_preset = dlss_render_preset;
             // MVs are generated at the TAA resolution in pixel units of that
-            // resolution; DLSS expects input-resolution pixels, and our input
-            // is the TAA resolution downscaled by 1.5, so convert here.
+            // resolution; DLSS expects input-resolution pixels. Input and TAA
+            // resolution are identical here (DLAA) so the scale is 1.0, but be
+            // kept in this form so it stays correct if they ever diverge.
             settings_data.mvs_x_scale = (float)settings_data.render_width / (float)taa_output_texture_desc.Width;
             settings_data.mvs_y_scale = (float)settings_data.render_height / (float)taa_output_texture_desc.Height;
             sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
@@ -1207,12 +1078,12 @@ public:
                draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.depth_buffer.get();
                draw_data.pre_exposure = 0.0f; // automatic exposure
-               // Jitter offset must be in DLSS input pixels (the downscaled
-               // source), not the game render resolution.
+               // Jitter offset must be in DLSS input pixels, not in the stale
+               // game_device_data.render_resolution (only set once at init).
                draw_data.jitter_x = game_device_data.jitter.x * settings_data.render_width * 0.5f;
                draw_data.jitter_y = game_device_data.jitter.y * settings_data.render_height * -0.5f;
                draw_data.reset = reset_sr;
-               // Must match the actual DLSS input texture (the downscaled RT)
+               // Must match the actual DLSS input texture (the TAA source color)
                // and the declared render size: InRenderSubrectDimensions that
                // exceeds the input texture makes NGX return InvalidParameter.
                draw_data.render_width = settings_data.render_width;

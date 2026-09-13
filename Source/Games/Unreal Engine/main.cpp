@@ -905,13 +905,20 @@ public:
             native_device_context->RSGetViewports(&num_viewports, &viewport);
             // game_device_data.viewport_rect         = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height};
             // game_device_data.render_resolution     = {(float)taa_output_texture_desc.Width, (float)taa_output_texture_desc.Height, 1.0f / (float)taa_output_texture_desc.Width, 1.0f / (float)taa_output_texture_desc.Height};
-            device_data.sr_render_resolution_scale = 1.0f; // DLAA only
+            // True super-resolution: declare a 1.5x (DLSS Quality) ratio so
+            // the SR pipeline knows the source is upscaled, like FF7R's mod.
+            device_data.sr_render_resolution_scale = 1.0f / 1.5f;
 
             SR::SettingsData settings_data;
             settings_data.output_width = taa_output_texture_desc.Width;
             settings_data.output_height = taa_output_texture_desc.Height;
-            settings_data.render_width = game_device_data.render_resolution.x;
-            settings_data.render_height = game_device_data.render_resolution.y;
+            // Declare the DLSS render size as output / 1.5 (DLSS Quality).
+            // No rounding alignment: the value must match what the blit pass
+            // below produces and what NGX optimal settings returns for the
+            // current output size, otherwise quality auto-pick fails and we
+            // fall back to DLAA. 2560->1706, 1920->1280, 1440->960, 1080->720.
+            settings_data.render_width = (uint32_t)(taa_output_texture_desc.Width / 1.5f);
+            settings_data.render_height = (uint32_t)(taa_output_texture_desc.Height / 1.5f);
             settings_data.dynamic_resolution = true;
             settings_data.hdr = true; // Unreal Engine does DLSS before tonemapping, in HDR linear space
             settings_data.inverted_depth = true;
@@ -962,6 +969,69 @@ public:
             {
                game_device_data.sr_source_color = nullptr;
                shader_resources[taa_shader_info.source_texture_register]->GetResource(&game_device_data.sr_source_color);
+               // --- Source color downscale (DLSS true super-resolution) ---
+               // The generic mod feeds the full-resolution TAA source to
+               // DLSS and declares render == output (DLAA only). Instead,
+               // blit the source into a smaller RT (settings_data.render_*)
+               // and feed that to DLSS, so it performs a real 1.5x upsample.
+               // Target size is taken from settings_data so the declared
+               // render dimensions and the actual input texture always match.
+               {
+                  // Function-local statics: program lifetime, no class changes.
+                  static com_ptr<ID3D11Texture2D> scaled_rt;
+                  static uint32_t scaled_w = 0;
+                  static uint32_t scaled_h = 0;
+
+                  if (game_device_data.sr_source_color.get() && settings_data.render_width > 0 && settings_data.render_height > 0)
+                  {
+                     com_ptr<ID3D11Texture2D> src_tex;
+                     if (SUCCEEDED(game_device_data.sr_source_color->QueryInterface(&src_tex)) && src_tex.get())
+                     {
+                        D3D11_TEXTURE2D_DESC src_desc;
+                        src_tex->GetDesc(&src_desc);
+                        const uint32_t target_w = settings_data.render_width;
+                        const uint32_t target_h = settings_data.render_height;
+                        // Only downscale when the target is strictly smaller,
+                        // sane, and the source is not multisampled (StretchRect
+                        // does not support MSAA).
+                        if (target_w >= 64 && target_h >= 64 &&
+                            target_w < src_desc.Width && target_h < src_desc.Height &&
+                            src_desc.SampleDesc.Count <= 1)
+                        {
+                           if (!scaled_rt.get() || scaled_w != target_w || scaled_h != target_h)
+                           {
+                              D3D11_TEXTURE2D_DESC small_desc = src_desc;
+                              small_desc.Width = target_w;
+                              small_desc.Height = target_h;
+                              small_desc.MipLevels = 1;
+                              small_desc.SampleDesc = { 1, 0 };
+                              small_desc.Usage = D3D11_USAGE_DEFAULT;
+                              small_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                              small_desc.CPUAccessFlags = 0;
+                              small_desc.MiscFlags = 0;
+                              scaled_rt = nullptr;
+                              const HRESULT hr_create = native_device->CreateTexture2D(&small_desc, nullptr, &scaled_rt);
+                              ASSERT_ONCE(SUCCEEDED(hr_create));
+                              if (SUCCEEDED(hr_create))
+                              {
+                                 scaled_w = target_w;
+                                 scaled_h = target_h;
+                              }
+                           }
+                           if (scaled_rt.get())
+                           {
+                              native_device_context->StretchRect(
+                                 game_device_data.sr_source_color.get(), 0,
+                                 scaled_rt.get(), 0,
+                                 nullptr);
+                              // com_ptr has no cross-type assignment; the raw
+                              // pointer overload AddRefs inside reset().
+                              game_device_data.sr_source_color = scaled_rt.get();
+                           }
+                        }
+                     }
+                  }
+               }
                game_device_data.depth_buffer = nullptr;
                shader_resources[taa_shader_info.depth_texture_register]->GetResource(&game_device_data.depth_buffer);
                com_ptr<ID3D11Resource> object_velocity;

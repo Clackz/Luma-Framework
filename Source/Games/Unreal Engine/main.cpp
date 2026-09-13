@@ -15,6 +15,36 @@ namespace
    ShaderHashesList shader_hashes_Dithering; // Dithering shader list
    ShaderHashesList shader_hashes_tonemap_candidates;
    ShaderHashesList shader_hashes_tonemap_lut_candidates;
+
+   // Final ScreenPercentage upscale pass. Its input is the internal render
+   // resolution and its output is the backbuffer, which makes it the only slot
+   // where true super-resolution is possible (the TAA slot is 1:1, DLAA only).
+   // The pass is a single bilinear sample clamped to the input UV bounds:
+   //    max r0.xy, v0.xy, cb0[34].xy
+   //    min r0.xy, r0.xy, cb0[34].zw
+   //    sample_l t0
+   ShaderHashesList shader_hashes_upscale;
+   constexpr bool sr_hook_upscale = true;
+   bool sr_upscale_hashes_ready = false;
+
+   static inline void LogUpscalePass(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h, DXGI_FORMAT fmt)
+   {
+      static uint32_t seen_dim[64][4];
+      static int seen_n = 0;
+      if (seen_n >= 64)
+         return;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen_dim[i][0] == in_w && seen_dim[i][1] == in_h && seen_dim[i][2] == out_w && seen_dim[i][3] == out_h)
+            return;
+      }
+      seen_dim[seen_n][0] = in_w;
+      seen_dim[seen_n][1] = in_h;
+      seen_dim[seen_n][2] = out_w;
+      seen_dim[seen_n][3] = out_h;
+      seen_n++;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-UPSCALE: IN {}x{} OUT {}x{} fmt {}", in_w, in_h, out_w, out_h, (int)fmt).c_str());
+   }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
    std::shared_mutex ssao_mutex;      // Added mutex for SSAO info
@@ -561,80 +591,174 @@ public:
       GameDeviceDataUnrealEngine& game_device_data = GetGameDeviceData(device_data);
       bool is_compute_shader = stages == reshade::api::shader_stage::all_compute;
 
-      // --- DIAGNOSTIC: locate the ScreenPercentage upscale pass ---
-      // Logs, once per unique (shader, RT size, input size) combination and
-      // capped at 512 entries, the pixel shader hash together with the render
-      // target size and the first input texture size. A pass whose output is
-      // LARGER than its input is an upscale: that is the pass we want to hook
-      // for true super-resolution (the TAA slot exposed by the generic mod is
-      // 1:1, so it can only do DLAA).
+#if ENABLE_SR
+      // --- True super-resolution: replace the ScreenPercentage upscale pass ---
+      // Motion vectors are decoded earlier in the frame (see the TAA slot below)
+      // and the depth buffer is captured there too, so everything needed by NGX
+      // is already available by the time this pass runs. If anything is missing
+      // we fall through and let the game's own bilinear upscale run instead.
       {
-         static uint64_t diag_keys[512];
-         static int diag_n = 0;
-         if (!is_compute_shader && diag_n < 512)
+         if (!sr_upscale_hashes_ready)
          {
-            const auto diag_hash = original_shader_hashes.pixel_shaders[0];
-            if (diag_hash != 0)
+            shader_hashes_upscale.pixel_shaders.emplace(static_cast<unsigned long>(0x8D87DAEBu));
+            sr_upscale_hashes_ready = true;
+         }
+      }
+      if (sr_hook_upscale && !is_compute_shader &&
+          device_data.sr_type != SR::Type::None && !device_data.sr_suppressed &&
+          original_shader_hashes.Contains(shader_hashes_upscale) &&
+          game_device_data.sr_motion_vectors.get() != nullptr &&
+          game_device_data.depth_buffer.get() != nullptr)
+      {
+         com_ptr<ID3D11ShaderResourceView> upscale_input_srv;
+         native_device_context->PSGetShaderResources(0, 1, &upscale_input_srv);
+         com_ptr<ID3D11RenderTargetView> upscale_output_rtv;
+         native_device_context->OMGetRenderTargets(1, &upscale_output_rtv, nullptr);
+
+         if (upscale_input_srv.get() && upscale_output_rtv.get())
+         {
+            com_ptr<ID3D11Resource> upscale_input_resource;
+            upscale_input_srv->GetResource(&upscale_input_resource);
+            com_ptr<ID3D11Resource> upscale_output_resource;
+            upscale_output_rtv->GetResource(&upscale_output_resource);
+
+            com_ptr<ID3D11Texture2D> upscale_input_color;
+            com_ptr<ID3D11Texture2D> upscale_output_color;
+            if (upscale_input_resource.get() && upscale_output_resource.get())
             {
-               uint32_t diag_rt_w = 0, diag_rt_h = 0, diag_srv_w = 0, diag_srv_h = 0;
-               com_ptr<ID3D11RenderTargetView> diag_rtv;
-               com_ptr<ID3D11DepthStencilView> diag_dsv;
-               native_device_context->OMGetRenderTargets(1, &diag_rtv, &diag_dsv);
-               if (diag_rtv.get())
+               HRESULT hr_up_i = upscale_input_resource->QueryInterface(&upscale_input_color);
+               HRESULT hr_up_o = upscale_output_resource->QueryInterface(&upscale_output_color);
+               if (SUCCEEDED(hr_up_i) && SUCCEEDED(hr_up_o) && upscale_input_color.get() && upscale_output_color.get())
                {
-                  com_ptr<ID3D11Resource> diag_res;
-                  diag_rtv->GetResource(&diag_res);
-                  if (diag_res.get())
+                  D3D11_TEXTURE2D_DESC upscale_input_desc;
+                  upscale_input_color->GetDesc(&upscale_input_desc);
+                  D3D11_TEXTURE2D_DESC upscale_output_desc;
+                  upscale_output_color->GetDesc(&upscale_output_desc);
+
+                  LogUpscalePass(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height, upscale_input_desc.Format);
+
+                  if (upscale_input_desc.Width > 0 && upscale_input_desc.Height > 0 &&
+                      upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
                   {
-                     D3D11_RESOURCE_DIMENSION diag_dim;
-                     diag_res->GetType(&diag_dim);
-                     if (diag_dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                     auto* sr_instance_data = device_data.GetSRInstanceData();
+                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type];
+                     if (sr_instance_data && sr_impl)
                      {
-                        com_ptr<ID3D11Texture2D> diag_tex = (ID3D11Texture2D*)diag_res.get();
-                        D3D11_TEXTURE2D_DESC diag_desc;
-                        diag_tex->GetDesc(&diag_desc);
-                        diag_rt_w = diag_desc.Width;
-                        diag_rt_h = diag_desc.Height;
+                        SR::SettingsData settings_data;
+                        settings_data.output_width = upscale_output_desc.Width;
+                        settings_data.output_height = upscale_output_desc.Height;
+                        // Declared render size must be the REAL input texture size:
+                        // NGX uses it as InRenderSubrectDimensions (a crop), and it
+                        // returns FAIL_InvalidParameter if it exceeds the input.
+                        settings_data.render_width = upscale_input_desc.Width;
+                        settings_data.render_height = upscale_input_desc.Height;
+                        settings_data.dynamic_resolution = true;
+                        settings_data.hdr = true;
+                        settings_data.inverted_depth = true;
+                        settings_data.mvs_jittered = false;
+                        settings_data.auto_exposure = sr_auto_exposure;
+                        settings_data.render_preset = dlss_render_preset;
+                        // Motion vectors live at the TAA resolution and are expressed
+                        // in pixels of that resolution, while the declared render
+                        // size is the (possibly lower) internal resolution.
+                        D3D11_TEXTURE2D_DESC mv_texture_desc;
+                        game_device_data.sr_motion_vectors->GetDesc(&mv_texture_desc);
+                        settings_data.mvs_x_scale = mv_texture_desc.Width ? (float)upscale_input_desc.Width / (float)mv_texture_desc.Width : 1.0f;
+                        settings_data.mvs_y_scale = mv_texture_desc.Height ? (float)upscale_input_desc.Height / (float)mv_texture_desc.Height : 1.0f;
+                        sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+
+                        constexpr bool sr_use_native_uav = true;
+                        bool sr_output_supports_uav = sr_use_native_uav && (upscale_output_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
+                        bool skip_sr = upscale_input_desc.Width < sr_instance_data->min_resolution || upscale_input_desc.Height < sr_instance_data->min_resolution;
+                        bool sr_output_changed = false;
+
+                        if (!sr_output_supports_uav)
+                        {
+                           D3D11_TEXTURE2D_DESC sr_output_texture_desc = upscale_output_desc;
+                           sr_output_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+                           if (device_data.sr_output_color.get())
+                           {
+                              D3D11_TEXTURE2D_DESC prev_sr_output_desc;
+                              device_data.sr_output_color->GetDesc(&prev_sr_output_desc);
+                              sr_output_changed = prev_sr_output_desc.Width != sr_output_texture_desc.Width ||
+                                                  prev_sr_output_desc.Height != sr_output_texture_desc.Height ||
+                                                  prev_sr_output_desc.Format != sr_output_texture_desc.Format;
+                           }
+                           if (!device_data.sr_output_color.get() || sr_output_changed)
+                           {
+                              device_data.sr_output_color = nullptr; // Make sure we discard the previous one
+                              HRESULT hr_sr = native_device->CreateTexture2D(&sr_output_texture_desc, nullptr, &device_data.sr_output_color);
+                              ASSERT_ONCE(SUCCEEDED(hr_sr));
+                           }
+                           if (!device_data.sr_output_color.get())
+                              skip_sr = true;
+                        }
+                        else
+                        {
+                           device_data.sr_output_color = upscale_output_color;
+                        }
+
+                        if (!skip_sr)
+                        {
+                           DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+                           DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
+                           draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                           compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+
+                           if (!updated_cbuffers)
+                           {
+                              constexpr bool do_safety_checks = false; // No need to check as we cache the states and restore them.
+                              SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings, 0, 0, 0.f, 0.f, do_safety_checks);
+                              SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, 0.f, 0.f, do_safety_checks);
+                           }
+
+                           bool reset_sr = device_data.force_reset_sr || sr_output_changed || game_device_data.camera_cut;
+                           device_data.force_reset_sr = false;
+
+                           SR::SuperResolutionImpl::DrawData draw_data;
+                           draw_data.source_color = upscale_input_color.get();
+                           draw_data.output_color = device_data.sr_output_color.get();
+                           draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
+                           draw_data.depth_buffer = game_device_data.depth_buffer.get();
+                           draw_data.pre_exposure = 0.0f; // automatic exposure
+                           // Jitter must be expressed in DLSS input pixels.
+                           draw_data.jitter_x = game_device_data.jitter.x * (float)upscale_input_desc.Width * 0.5f;
+                           draw_data.jitter_y = game_device_data.jitter.y * (float)upscale_input_desc.Height * -0.5f;
+                           draw_data.reset = reset_sr;
+                           draw_data.render_width = upscale_input_desc.Width;
+                           draw_data.render_height = upscale_input_desc.Height;
+                           draw_data.near_plane = game_device_data.near_plane / 100.0f;
+                           draw_data.far_plane = FLT_MAX;
+                           draw_data.vert_fov = game_device_data.fov_y;
+
+                           bool sr_succeeded = sr_impl->Draw(sr_instance_data, native_device_context, draw_data);
+
+                           draw_state_stack.Restore(native_device_context);
+                           compute_state_stack.Restore(native_device_context);
+
+                           game_device_data.camera_cut = false;
+                           game_device_data.depth_buffer = nullptr;
+
+                           if (sr_succeeded)
+                           {
+                              device_data.has_drawn_sr = true;
+                              if (!sr_output_supports_uav)
+                                 native_device_context->CopyResource(upscale_output_color.get(), device_data.sr_output_color.get()); // DX11 doesn't need barriers
+                              else
+                                 device_data.sr_output_color = nullptr;
+                              return DrawOrDispatchOverrideType::Replaced;
+                           }
+                           device_data.force_reset_sr = true;
+                        }
+                        if (sr_output_supports_uav)
+                           device_data.sr_output_color = nullptr;
                      }
-                  }
-               }
-               com_ptr<ID3D11ShaderResourceView> diag_srv;
-               native_device_context->PSGetShaderResources(0, 1, &diag_srv);
-               if (diag_srv.get())
-               {
-                  com_ptr<ID3D11Resource> diag_res2;
-                  diag_srv->GetResource(&diag_res2);
-                  if (diag_res2.get())
-                  {
-                     D3D11_RESOURCE_DIMENSION diag_dim2;
-                     diag_res2->GetType(&diag_dim2);
-                     if (diag_dim2 == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-                     {
-                        com_ptr<ID3D11Texture2D> diag_tex2 = (ID3D11Texture2D*)diag_res2.get();
-                        D3D11_TEXTURE2D_DESC diag_desc2;
-                        diag_tex2->GetDesc(&diag_desc2);
-                        diag_srv_w = diag_desc2.Width;
-                        diag_srv_h = diag_desc2.Height;
-                     }
-                  }
-               }
-               if (diag_rt_w != 0 && diag_srv_w != 0 && (diag_rt_w != diag_srv_w || diag_rt_h != diag_srv_h))
-               {
-                  const uint64_t diag_key = ((uint64_t)diag_hash << 32) | ((uint64_t)(diag_rt_w & 0xFFFF) << 16) | (uint64_t)(diag_srv_w & 0xFFFF);
-                  bool diag_seen = false;
-                  for (int diag_i = 0; diag_i < diag_n; diag_i++)
-                  {
-                     if (diag_keys[diag_i] == diag_key) { diag_seen = true; break; }
-                  }
-                  if (!diag_seen)
-                  {
-                     diag_keys[diag_n++] = diag_key;
-                     reshade::log::message(reshade::log::level::info, std::format("UE4-DIAG: PS 0x{:08X} RT {}x{} IN {}x{}", diag_hash, diag_rt_w, diag_rt_h, diag_srv_w, diag_srv_h).c_str());
                   }
                }
             }
          }
       }
+#endif // ENABLE_SR
 
       // TODO: filter then to a more optimized list after confirming them
       // Find the shader that reads the tonemap LUT to do the per tonemapping.
@@ -950,6 +1074,77 @@ public:
                return DrawOrDispatchOverrideType::None;
             auto* sr_instance_data = device_data.GetSRInstanceData();
             ASSERT_ONCE(sr_instance_data);
+
+            if (sr_hook_upscale)
+            {
+               // The ScreenPercentage upscale happens in a later pass, so the
+               // super-resolution draw is done there (see above) rather than here.
+               // We still own this slot for what only it can provide: the decoded
+               // motion vectors and the depth buffer, which NGX needs later.
+               shader_resources[taa_shader_info.depth_texture_register]->GetResource(&game_device_data.depth_buffer);
+               com_ptr<ID3D11Resource> object_velocity;
+               shader_resources[taa_shader_info.velocity_texture_register]->GetResource(&object_velocity);
+               if (object_velocity.get())
+               {
+                  if (!AreResourcesEqual(object_velocity.get(), game_device_data.sr_motion_vectors.get(), false /*check_format*/))
+                  {
+                     com_ptr<ID3D11Texture2D> object_velocity_texture;
+                     HRESULT hr_vel = object_velocity->QueryInterface(&object_velocity_texture);
+                     ASSERT_ONCE(SUCCEEDED(hr_vel));
+                     if (object_velocity_texture.get())
+                     {
+                        D3D11_TEXTURE2D_DESC object_velocity_texture_desc;
+                        object_velocity_texture->GetDesc(&object_velocity_texture_desc);
+                        object_velocity_texture_desc.Format = DXGI_FORMAT_R32G32_FLOAT; // Higher precision than the game's R16G16F, reduces shimmering on fine lines
+                        if (is_compute_shader)
+                        {
+                           object_velocity_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+                           object_velocity_texture_desc.BindFlags &= ~D3D11_BIND_RENDER_TARGET;
+                           game_device_data.sr_motion_vectors_uav = nullptr; // Make sure we discard the previous one
+                           game_device_data.sr_motion_vectors = nullptr;     // Make sure we discard the previous one
+                           hr_vel = native_device->CreateTexture2D(&object_velocity_texture_desc, nullptr, &game_device_data.sr_motion_vectors);
+                           ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           if (SUCCEEDED(hr_vel))
+                           {
+                              hr_vel = native_device->CreateUnorderedAccessView(game_device_data.sr_motion_vectors.get(), nullptr, &game_device_data.sr_motion_vectors_uav);
+                              ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           }
+                        }
+                        else
+                        {
+                           game_device_data.sr_motion_vectors_rtv = nullptr; // Make sure we discard the previous one
+                           game_device_data.sr_motion_vectors = nullptr;     // Make sure we discard the previous one
+                           hr_vel = native_device->CreateTexture2D(&object_velocity_texture_desc, nullptr, &game_device_data.sr_motion_vectors);
+                           ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           if (SUCCEEDED(hr_vel))
+                           {
+                              hr_vel = native_device->CreateRenderTargetView(game_device_data.sr_motion_vectors.get(), nullptr, &game_device_data.sr_motion_vectors_rtv);
+                              ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           }
+                        }
+                     }
+                  }
+                  if (game_device_data.sr_motion_vectors.get())
+                  {
+                     DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+                     DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
+                     draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                     compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                     if (!updated_cbuffers)
+                     {
+                        constexpr bool do_safety_checks = false; // No need to check as we cache the states and restore them.
+                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings, 0, 0, 0.f, 0.f, do_safety_checks);
+                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, 0.f, 0.f, do_safety_checks);
+                     }
+                     DecodeMotionVectors(is_compute_shader, native_device_context, device_data, taa_shader_info);
+                     draw_state_stack.Restore(native_device_context);
+                     compute_state_stack.Restore(native_device_context);
+                  }
+               }
+               // The game's own TAA still has to run: it produces the image that
+               // the later upscale pass consumes.
+               return DrawOrDispatchOverrideType::None;
+            }
 
             com_ptr<ID3D11Resource> output_color_resource;
             if (is_compute_shader)

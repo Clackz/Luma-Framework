@@ -1,0 +1,62 @@
+name: Build UE Mod Only
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ue-test:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll
+      # as dxgi.dll for the x64 addon. The 32-bit build is skipped on purpose.
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      # Build only the Unreal Engine addon (main.cpp + Core unity_build.cpp are
+      # compiled in this project; there are no project references). No
+      # continue-on-error: a compile error must fail the run loudly.
+      - name: Build Unreal Engine addon (Test-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Unreal Engine" /p:Configuration="Test-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration="Test-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Package Unreal Engine addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Unreal Engine" -Config "Test-Release" -Platform "x64" -OutDir "."
+
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Luma-Unreal_Engine-Test.zip")) {
+            Write-Host "::error::Luma-Unreal_Engine-Test.zip was not produced!"
+            exit 1
+          }
+          Get-Item "Luma-Unreal_Engine-Test.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-UE-Test
+          path: Luma-Unreal_Engine-Test.zip
+          if-no-files-found: error

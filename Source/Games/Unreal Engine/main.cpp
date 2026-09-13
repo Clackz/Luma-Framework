@@ -925,8 +925,11 @@ public:
             settings_data.mvs_jittered = false;
             settings_data.auto_exposure = sr_auto_exposure; // Unreal Engine does TAA before tonemapping
             settings_data.render_preset = dlss_render_preset;
-            settings_data.mvs_x_scale = 1.0f;
-            settings_data.mvs_y_scale = 1.0f;
+            // MVs are generated at the TAA resolution in pixel units of that
+            // resolution; DLSS expects input-resolution pixels, and our input
+            // is the TAA resolution downscaled by 1.5, so convert here.
+            settings_data.mvs_x_scale = (float)settings_data.render_width / (float)taa_output_texture_desc.Width;
+            settings_data.mvs_y_scale = (float)settings_data.render_height / (float)taa_output_texture_desc.Height;
             sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
             constexpr bool dlss_use_native_uav = true;
@@ -1129,11 +1132,16 @@ public:
                draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.depth_buffer.get();
                draw_data.pre_exposure = 0.0f; // automatic exposure
-               draw_data.jitter_x = game_device_data.jitter.x * game_device_data.render_resolution.x * 0.5f;
-               draw_data.jitter_y = game_device_data.jitter.y * game_device_data.render_resolution.y * -0.5f;
+               // Jitter offset must be in DLSS input pixels (the downscaled
+               // source), not the game render resolution.
+               draw_data.jitter_x = game_device_data.jitter.x * settings_data.render_width * 0.5f;
+               draw_data.jitter_y = game_device_data.jitter.y * settings_data.render_height * -0.5f;
                draw_data.reset = reset_sr;
-               draw_data.render_width = game_device_data.render_resolution.x;
-               draw_data.render_height = game_device_data.render_resolution.y;
+               // Must match the actual DLSS input texture (the downscaled RT)
+               // and the declared render size: InRenderSubrectDimensions that
+               // exceeds the input texture makes NGX return InvalidParameter.
+               draw_data.render_width = settings_data.render_width;
+               draw_data.render_height = settings_data.render_height;
                draw_data.near_plane = game_device_data.near_plane / 100.0f;
                draw_data.far_plane = FLT_MAX; // TODO: made up values
                draw_data.vert_fov = game_device_data.fov_y;

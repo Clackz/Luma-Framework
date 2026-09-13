@@ -561,6 +561,81 @@ public:
       GameDeviceDataUnrealEngine& game_device_data = GetGameDeviceData(device_data);
       bool is_compute_shader = stages == reshade::api::shader_stage::all_compute;
 
+      // --- DIAGNOSTIC: locate the ScreenPercentage upscale pass ---
+      // Logs, once per unique (shader, RT size, input size) combination and
+      // capped at 512 entries, the pixel shader hash together with the render
+      // target size and the first input texture size. A pass whose output is
+      // LARGER than its input is an upscale: that is the pass we want to hook
+      // for true super-resolution (the TAA slot exposed by the generic mod is
+      // 1:1, so it can only do DLAA).
+      {
+         static uint64_t diag_keys[512];
+         static int diag_n = 0;
+         if (!is_compute_shader && diag_n < 512)
+         {
+            const auto diag_hash = original_shader_hashes.pixel_shaders[0];
+            if (diag_hash != 0)
+            {
+               uint32_t diag_rt_w = 0, diag_rt_h = 0, diag_srv_w = 0, diag_srv_h = 0;
+               com_ptr<ID3D11RenderTargetView> diag_rtv;
+               com_ptr<ID3D11DepthStencilView> diag_dsv;
+               native_device_context->OMGetRenderTargets(1, &diag_rtv, &diag_dsv);
+               if (diag_rtv.get())
+               {
+                  com_ptr<ID3D11Resource> diag_res;
+                  diag_rtv->GetResource(&diag_res);
+                  if (diag_res.get())
+                  {
+                     D3D11_RESOURCE_DIMENSION diag_dim;
+                     diag_res->GetType(&diag_dim);
+                     if (diag_dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                     {
+                        com_ptr<ID3D11Texture2D> diag_tex = (ID3D11Texture2D*)diag_res.get();
+                        D3D11_TEXTURE2D_DESC diag_desc;
+                        diag_tex->GetDesc(&diag_desc);
+                        diag_rt_w = diag_desc.Width;
+                        diag_rt_h = diag_desc.Height;
+                     }
+                  }
+               }
+               com_ptr<ID3D11ShaderResourceView> diag_srv;
+               native_device_context->PSGetShaderResources(0, 1, &diag_srv);
+               if (diag_srv.get())
+               {
+                  com_ptr<ID3D11Resource> diag_res2;
+                  diag_srv->GetResource(&diag_res2);
+                  if (diag_res2.get())
+                  {
+                     D3D11_RESOURCE_DIMENSION diag_dim2;
+                     diag_res2->GetType(&diag_dim2);
+                     if (diag_dim2 == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                     {
+                        com_ptr<ID3D11Texture2D> diag_tex2 = (ID3D11Texture2D*)diag_res2.get();
+                        D3D11_TEXTURE2D_DESC diag_desc2;
+                        diag_tex2->GetDesc(&diag_desc2);
+                        diag_srv_w = diag_desc2.Width;
+                        diag_srv_h = diag_desc2.Height;
+                     }
+                  }
+               }
+               if (diag_rt_w != 0 && diag_srv_w != 0 && (diag_rt_w != diag_srv_w || diag_rt_h != diag_srv_h))
+               {
+                  const uint64_t diag_key = ((uint64_t)diag_hash << 32) | ((uint64_t)(diag_rt_w & 0xFFFF) << 16) | (uint64_t)(diag_srv_w & 0xFFFF);
+                  bool diag_seen = false;
+                  for (int diag_i = 0; diag_i < diag_n; diag_i++)
+                  {
+                     if (diag_keys[diag_i] == diag_key) { diag_seen = true; break; }
+                  }
+                  if (!diag_seen)
+                  {
+                     diag_keys[diag_n++] = diag_key;
+                     reshade::log::message(reshade::log::level::info, std::format("UE4-DIAG: PS 0x{:08X} RT {}x{} IN {}x{}", diag_hash, diag_rt_w, diag_rt_h, diag_srv_w, diag_srv_h).c_str());
+                  }
+               }
+            }
+         }
+      }
+
       // TODO: filter then to a more optimized list after confirming them
       // Find the shader that reads the tonemap LUT to do the per tonemapping.
       // This usually happens after every other post process and TAA, just before UI, and directly writes on the swapchain.

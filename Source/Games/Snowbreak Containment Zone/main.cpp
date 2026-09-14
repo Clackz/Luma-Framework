@@ -1,4 +1,20 @@
-#define GAME_SNOWBREAK_CONTAINMENT_ZONE 1
+// This macro identifies the "engine family" the mod plugs into, not the game.
+// Snowbreak is UE4, so it must keep GAME_UNREAL_ENGINE: Source/Core/core.hpp
+// keys off it in three places, and dropping it silently changes behaviour.
+//   * core.hpp:1096 - IsModActive() returns true for UE/Relink. The generic UE
+//     mod replaces no game shader statically, so cloned_pipeline_count stays 0:
+//     without the macro IsModActive() reports "mod inactive" while the upgrade
+//     machinery is still live, and present-time output defines (POST_PROCESS_
+//     SPACE_TYPE, GAMMA_CORRECTION_TYPE) and enable_ui_separation get skipped.
+//     Observed result: an assert in resource_upgrades.inl "Failed to create an
+//     indirect upgraded texture view (maybe some format mismatch)".
+//   * core.hpp:16354 - UE decides whether to enable texture upgrades at runtime
+//     (after CoreMain, from its DllMain), so its resource/view events must be
+//     registered unconditionally instead of from the load-time settings
+//     snapshot the #else branch relies on.
+// The project's own name (PROJECT_NAME, from the vcxproj) is what selects the
+// shader mount and the GAME_<NAME> shader define; the two are independent.
+#define GAME_UNREAL_ENGINE 1
 
 #define LUMA_PATCH_BYTECODE_SYNC 1
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1

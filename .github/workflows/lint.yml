@@ -24,7 +24,7 @@ jobs:
           style: file
           files-changed-only: true # should be set to true initially, but false for testing
           thread-comments: false
-          ignore: 'Source/External/** | **/safetyhook* | **/Zydis* | Source/Games/Unreal Engine/**'
+          ignore: 'Source/External/** | **/safetyhook* | **/Zydis* | Source/Games/Unreal Engine/** | Source/Games/Snowbreak Containment Zone/**'
       - name: Fail fast?!
         if: steps.linter.outputs.checks-failed > 0
         run: exit 1

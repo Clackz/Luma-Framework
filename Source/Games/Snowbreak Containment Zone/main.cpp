@@ -1,4 +1,4 @@
-#define GAME_UNREAL_ENGINE 1
+#define GAME_SNOWBREAK_CONTAINMENT_ZONE 1
 
 #define LUMA_PATCH_BYTECODE_SYNC 1
 #define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
@@ -15,6 +15,91 @@ namespace
    ShaderHashesList shader_hashes_Dithering; // Dithering shader list
    ShaderHashesList shader_hashes_tonemap_candidates;
    ShaderHashesList shader_hashes_tonemap_lut_candidates;
+
+   // Final ScreenPercentage upscale pass. Its input is the internal render
+   // resolution and its output is the backbuffer, which makes it the only slot
+   // where true super-resolution is possible (the TAA slot is 1:1, DLAA only).
+   // The pass is a single bilinear sample clamped to the input UV bounds:
+   //    max r0.xy, v0.xy, cb0[34].xy
+   //    min r0.xy, r0.xy, cb0[34].zw
+   //    sample_l t0
+   ShaderHashesList shader_hashes_upscale;
+   constexpr bool sr_hook_upscale = true;
+   bool sr_upscale_hashes_ready = false;
+
+   static inline void LogUpscalePass(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h, DXGI_FORMAT fmt)
+   {
+      static uint32_t seen_dim[64][4];
+      static int seen_n = 0;
+      if (seen_n >= 64)
+         return;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen_dim[i][0] == in_w && seen_dim[i][1] == in_h && seen_dim[i][2] == out_w && seen_dim[i][3] == out_h)
+            return;
+      }
+      seen_dim[seen_n][0] = in_w;
+      seen_dim[seen_n][1] = in_h;
+      seen_dim[seen_n][2] = out_w;
+      seen_dim[seen_n][3] = out_h;
+      seen_n++;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-UPSCALE: IN {}x{} OUT {}x{} fmt {}", in_w, in_h, out_w, out_h, (int)fmt).c_str());
+   }
+
+   // Number of UpdateSettings calls actually forwarded to OptiScaler. The
+   // eleven compared fields only change on a real render-size/render-state
+   // move, so this should stay near the number of distinct settings tuples -
+   // not the ~80/s the pass itself runs at.
+   static uint64_t sr_update_calls = 0;
+
+   // SR::SettingsData::operator== compares eleven fields, but OptiScaler's log
+   // only prints the render/display sizes, so a change in any of the others is
+   // invisible there while still forcing UpdateSettings to release and rebuild
+   // the NGX feature. Dump the full tuple once per distinct combination, plus
+   // the raw motion-vector size and whether it was accepted, so a rebuild that
+   // these settings did NOT ask for can be told apart from one they did.
+   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used)
+   {
+      static SR::SettingsData seen[32];
+      static int seen_n = 0;
+      static uint64_t calls = 0;
+      calls++;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen[i] == s)
+            return;
+      }
+      if (seen_n < 32)
+         seen[seen_n++] = s;
+      reshade::log::message(reshade::log::level::warning, std::format(
+         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
+         seen_n, calls, sr_update_calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
+         mv_used ? "used" : "stale", s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
+         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset).c_str());
+   }
+
+   // The upscale pass is only a resolution change when input and output share
+   // the aspect ratio. Loads of other combinations reach the same shader, so
+   // log the first sighting of each rejected one: they explain both the cases
+   // SR is skipped in and, if a "zoomed in" report follows, which pass did it.
+   static inline void LogUpscaleSkip(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h, const char* reason)
+   {
+      static uint32_t seen_dim[32][4];
+      static int seen_n = 0;
+      if (seen_n >= 32)
+         return;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen_dim[i][0] == in_w && seen_dim[i][1] == in_h && seen_dim[i][2] == out_w && seen_dim[i][3] == out_h)
+            return;
+      }
+      seen_dim[seen_n][0] = in_w;
+      seen_dim[seen_n][1] = in_h;
+      seen_dim[seen_n][2] = out_w;
+      seen_dim[seen_n][3] = out_h;
+      seen_n++;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-SKIP: {} IN {}x{} OUT {}x{}", reason, in_w, in_h, out_w, out_h).c_str());
+   }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
    std::shared_mutex ssao_mutex;      // Added mutex for SSAO info
@@ -561,6 +646,233 @@ public:
       GameDeviceDataUnrealEngine& game_device_data = GetGameDeviceData(device_data);
       bool is_compute_shader = stages == reshade::api::shader_stage::all_compute;
 
+#if ENABLE_SR
+      // --- True super-resolution: replace the ScreenPercentage upscale pass ---
+      // Motion vectors are decoded earlier in the frame (see the TAA slot below)
+      // and the depth buffer is captured there too, so everything needed by NGX
+      // is already available by the time this pass runs. If anything is missing
+      // we fall through and let the game's own bilinear upscale run instead.
+      {
+         if (!sr_upscale_hashes_ready)
+         {
+            shader_hashes_upscale.pixel_shaders.emplace(static_cast<unsigned long>(0x8D87DAEBu));
+            sr_upscale_hashes_ready = true;
+         }
+      }
+      if (sr_hook_upscale && !is_compute_shader &&
+          device_data.sr_type != SR::Type::None && !device_data.sr_suppressed &&
+          original_shader_hashes.Contains(shader_hashes_upscale) &&
+          game_device_data.sr_motion_vectors.get() != nullptr &&
+          game_device_data.depth_buffer.get() != nullptr)
+      {
+         com_ptr<ID3D11ShaderResourceView> upscale_input_srv;
+         native_device_context->PSGetShaderResources(0, 1, &upscale_input_srv);
+         com_ptr<ID3D11RenderTargetView> upscale_output_rtv;
+         native_device_context->OMGetRenderTargets(1, &upscale_output_rtv, nullptr);
+
+         if (upscale_input_srv.get() && upscale_output_rtv.get())
+         {
+            com_ptr<ID3D11Resource> upscale_input_resource;
+            upscale_input_srv->GetResource(&upscale_input_resource);
+            com_ptr<ID3D11Resource> upscale_output_resource;
+            upscale_output_rtv->GetResource(&upscale_output_resource);
+
+            com_ptr<ID3D11Texture2D> upscale_input_color;
+            com_ptr<ID3D11Texture2D> upscale_output_color;
+            if (upscale_input_resource.get() && upscale_output_resource.get())
+            {
+               HRESULT hr_up_i = upscale_input_resource->QueryInterface(&upscale_input_color);
+               HRESULT hr_up_o = upscale_output_resource->QueryInterface(&upscale_output_color);
+               if (SUCCEEDED(hr_up_i) && SUCCEEDED(hr_up_o) && upscale_input_color.get() && upscale_output_color.get())
+               {
+                  D3D11_TEXTURE2D_DESC upscale_input_desc;
+                  upscale_input_color->GetDesc(&upscale_input_desc);
+                  D3D11_TEXTURE2D_DESC upscale_output_desc;
+                  upscale_output_color->GetDesc(&upscale_output_desc);
+
+                  LogUpscalePass(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height, upscale_input_desc.Format);
+
+                  // A plain ScreenPercentage upscale only rescales, so its input
+                  // and output must share the aspect ratio. When they do not -
+                  // 1920x1280 into 2560x1440, seen right after leaving a battle
+                  // for the hub - this pass is instead blitting a *subrect* of
+                  // its input, which is what cb0[34] clamps the UVs to. Feeding
+                  // the whole texture to NGX magnifies that subrect: that is the
+                  // "the hub is zoomed in" report. Anything that is not a pure
+                  // aspect-preserving rescale is left to the game's own pass.
+                  const bool upscale_is_plain_rescale =
+                     (uint64_t)upscale_input_desc.Width * upscale_output_desc.Height ==
+                     (uint64_t)upscale_input_desc.Height * upscale_output_desc.Width;
+                  if (!upscale_is_plain_rescale)
+                     LogUpscaleSkip(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height, "aspect");
+
+                  if (upscale_is_plain_rescale &&
+                      upscale_input_desc.Width > 0 && upscale_input_desc.Height > 0 &&
+                      upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
+                  {
+                     auto* sr_instance_data = device_data.GetSRInstanceData();
+                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type].get();
+                     if (sr_instance_data && sr_impl)
+                     {
+                        SR::SettingsData settings_data;
+                        settings_data.output_width = upscale_output_desc.Width;
+                        settings_data.output_height = upscale_output_desc.Height;
+                        // Declared render size must be the REAL input texture size:
+                        // NGX uses it as InRenderSubrectDimensions (a crop), and it
+                        // returns FAIL_InvalidParameter if it exceeds the input.
+                        settings_data.render_width = upscale_input_desc.Width;
+                        settings_data.render_height = upscale_input_desc.Height;
+                        settings_data.dynamic_resolution = true;
+                        settings_data.hdr = true;
+                        settings_data.inverted_depth = true;
+                        settings_data.mvs_jittered = false;
+                        settings_data.auto_exposure = sr_auto_exposure;
+                        settings_data.render_preset = dlss_render_preset;
+                        // Motion vectors live at the TAA resolution and are expressed
+                        // in pixels of that resolution, while the declared render
+                        // size is the (possibly lower) internal resolution.
+                        // The ratio is one of the eleven fields SR::SettingsData
+                        // compares, so any instability here releases and rebuilds
+                        // the NGX feature. Keep the last valid ratio and reuse it
+                        // when the MV texture is momentarily absent, rather than
+                        // flipping to a different number for a frame.
+                        static float sr_mvs_x_scale = 1.0f;
+                        static float sr_mvs_y_scale = 1.0f;
+                        D3D11_TEXTURE2D_DESC mv_texture_desc = {};
+                        if (game_device_data.sr_motion_vectors.get())
+                           game_device_data.sr_motion_vectors->GetDesc(&mv_texture_desc);
+                        // UE4 substitutes a 1x1 placeholder for the velocity
+                        // target on frames that never ran a velocity pass at all
+                        // (menus, pause, map transitions). The previous "both
+                        // dimensions non-zero" test accepted it and derived
+                        // 1920x1080 / 1x1 = 1920.0/1080.0 - which differs from
+                        // the usual 1.0/1.0 by exactly the render scale.
+                        // SR::SettingsData compares the ratio, so every flip
+                        // between those two values made OptiScaler release and
+                        // rebuild the NGX feature (measured: CreateFeature, 8ms,
+                        // ReleaseFeature, then the same again 500ms later), which
+                        // is the periodic hitching in fights. Only a plausible
+                        // texture may move the ratio; otherwise the last valid
+                        // value is kept.
+                        const bool mv_size_plausible =
+                           mv_texture_desc.Width > 4 && mv_texture_desc.Height > 4 &&
+                           mv_texture_desc.Width <= upscale_input_desc.Width && mv_texture_desc.Height <= upscale_input_desc.Height;
+                        if (mv_size_plausible)
+                        {
+                           sr_mvs_x_scale = (float)upscale_input_desc.Width / (float)mv_texture_desc.Width;
+                           sr_mvs_y_scale = (float)upscale_input_desc.Height / (float)mv_texture_desc.Height;
+                        }
+                        settings_data.mvs_x_scale = sr_mvs_x_scale;
+                        settings_data.mvs_y_scale = sr_mvs_y_scale;
+                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mv_size_plausible);
+                        // Hand OptiScaler a change only when one of the eleven
+                        // compared fields actually moved. Re-sending an
+                        // identical tuple is a no-op for it but the comparison
+                        // itself runs on every one of the ~80 calls/s this pass
+                        // makes.
+                        static SR::SettingsData sr_last_settings;
+                        static bool sr_last_settings_valid = false;
+                        if (!sr_last_settings_valid || !(sr_last_settings == settings_data))
+                        {
+                           sr_last_settings = settings_data;
+                           sr_last_settings_valid = true;
+                           sr_update_calls++;
+                           sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+                        }
+
+                        constexpr bool sr_use_native_uav = true;
+                        bool sr_output_supports_uav = sr_use_native_uav && (upscale_output_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
+                        bool skip_sr = upscale_input_desc.Width < sr_instance_data->min_resolution || upscale_input_desc.Height < sr_instance_data->min_resolution;
+                        bool sr_output_changed = false;
+
+                        if (!sr_output_supports_uav)
+                        {
+                           D3D11_TEXTURE2D_DESC sr_output_texture_desc = upscale_output_desc;
+                           sr_output_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+                           if (device_data.sr_output_color.get())
+                           {
+                              D3D11_TEXTURE2D_DESC prev_sr_output_desc;
+                              device_data.sr_output_color->GetDesc(&prev_sr_output_desc);
+                              sr_output_changed = prev_sr_output_desc.Width != sr_output_texture_desc.Width ||
+                                                  prev_sr_output_desc.Height != sr_output_texture_desc.Height ||
+                                                  prev_sr_output_desc.Format != sr_output_texture_desc.Format;
+                           }
+                           if (!device_data.sr_output_color.get() || sr_output_changed)
+                           {
+                              device_data.sr_output_color = nullptr; // Make sure we discard the previous one
+                              HRESULT hr_sr = native_device->CreateTexture2D(&sr_output_texture_desc, nullptr, &device_data.sr_output_color);
+                              ASSERT_ONCE(SUCCEEDED(hr_sr));
+                           }
+                           if (!device_data.sr_output_color.get())
+                              skip_sr = true;
+                        }
+                        else
+                        {
+                           device_data.sr_output_color = upscale_output_color;
+                        }
+
+                        if (!skip_sr)
+                        {
+                           DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+                           DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
+                           draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                           compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+
+                           if (!updated_cbuffers)
+                           {
+                              constexpr bool do_safety_checks = false; // No need to check as we cache the states and restore them.
+                              SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings, 0, 0, 0.f, 0.f, do_safety_checks);
+                              SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, 0.f, 0.f, do_safety_checks);
+                           }
+
+                           bool reset_sr = device_data.force_reset_sr || sr_output_changed || game_device_data.camera_cut;
+                           device_data.force_reset_sr = false;
+
+                           SR::SuperResolutionImpl::DrawData draw_data;
+                           draw_data.source_color = upscale_input_color.get();
+                           draw_data.output_color = device_data.sr_output_color.get();
+                           draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
+                           draw_data.depth_buffer = game_device_data.depth_buffer.get();
+                           draw_data.pre_exposure = 0.0f; // automatic exposure
+                           // Jitter must be expressed in DLSS input pixels.
+                           draw_data.jitter_x = game_device_data.jitter.x * (float)upscale_input_desc.Width * 0.5f;
+                           draw_data.jitter_y = game_device_data.jitter.y * (float)upscale_input_desc.Height * -0.5f;
+                           draw_data.reset = reset_sr;
+                           draw_data.render_width = upscale_input_desc.Width;
+                           draw_data.render_height = upscale_input_desc.Height;
+                           draw_data.near_plane = game_device_data.near_plane / 100.0f;
+                           draw_data.far_plane = FLT_MAX;
+                           draw_data.vert_fov = game_device_data.fov_y;
+
+                           bool sr_succeeded = sr_impl->Draw(sr_instance_data, native_device_context, draw_data);
+
+                           draw_state_stack.Restore(native_device_context);
+                           compute_state_stack.Restore(native_device_context);
+
+                           game_device_data.camera_cut = false;
+                           game_device_data.depth_buffer = nullptr;
+
+                           if (sr_succeeded)
+                           {
+                              device_data.has_drawn_sr = true;
+                              if (!sr_output_supports_uav)
+                                 native_device_context->CopyResource(upscale_output_color.get(), device_data.sr_output_color.get()); // DX11 doesn't need barriers
+                              else
+                                 device_data.sr_output_color = nullptr;
+                              return DrawOrDispatchOverrideType::Replaced;
+                           }
+                           device_data.force_reset_sr = true;
+                        }
+                        if (sr_output_supports_uav)
+                           device_data.sr_output_color = nullptr;
+                     }
+                  }
+               }
+            }
+         }
+      }
+#endif // ENABLE_SR
+
       // TODO: filter then to a more optimized list after confirming them
       // Find the shader that reads the tonemap LUT to do the per tonemapping.
       // This usually happens after every other post process and TAA, just before UI, and directly writes on the swapchain.
@@ -876,6 +1188,77 @@ public:
             auto* sr_instance_data = device_data.GetSRInstanceData();
             ASSERT_ONCE(sr_instance_data);
 
+            if (sr_hook_upscale)
+            {
+               // The ScreenPercentage upscale happens in a later pass, so the
+               // super-resolution draw is done there (see above) rather than here.
+               // We still own this slot for what only it can provide: the decoded
+               // motion vectors and the depth buffer, which NGX needs later.
+               shader_resources[taa_shader_info.depth_texture_register]->GetResource(&game_device_data.depth_buffer);
+               com_ptr<ID3D11Resource> object_velocity;
+               shader_resources[taa_shader_info.velocity_texture_register]->GetResource(&object_velocity);
+               if (object_velocity.get())
+               {
+                  if (!AreResourcesEqual(object_velocity.get(), game_device_data.sr_motion_vectors.get(), false /*check_format*/))
+                  {
+                     com_ptr<ID3D11Texture2D> object_velocity_texture;
+                     HRESULT hr_vel = object_velocity->QueryInterface(&object_velocity_texture);
+                     ASSERT_ONCE(SUCCEEDED(hr_vel));
+                     if (object_velocity_texture.get())
+                     {
+                        D3D11_TEXTURE2D_DESC object_velocity_texture_desc;
+                        object_velocity_texture->GetDesc(&object_velocity_texture_desc);
+                        object_velocity_texture_desc.Format = DXGI_FORMAT_R32G32_FLOAT; // Higher precision than the game's R16G16F, reduces shimmering on fine lines
+                        if (is_compute_shader)
+                        {
+                           object_velocity_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+                           object_velocity_texture_desc.BindFlags &= ~D3D11_BIND_RENDER_TARGET;
+                           game_device_data.sr_motion_vectors_uav = nullptr; // Make sure we discard the previous one
+                           game_device_data.sr_motion_vectors = nullptr;     // Make sure we discard the previous one
+                           hr_vel = native_device->CreateTexture2D(&object_velocity_texture_desc, nullptr, &game_device_data.sr_motion_vectors);
+                           ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           if (SUCCEEDED(hr_vel))
+                           {
+                              hr_vel = native_device->CreateUnorderedAccessView(game_device_data.sr_motion_vectors.get(), nullptr, &game_device_data.sr_motion_vectors_uav);
+                              ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           }
+                        }
+                        else
+                        {
+                           game_device_data.sr_motion_vectors_rtv = nullptr; // Make sure we discard the previous one
+                           game_device_data.sr_motion_vectors = nullptr;     // Make sure we discard the previous one
+                           hr_vel = native_device->CreateTexture2D(&object_velocity_texture_desc, nullptr, &game_device_data.sr_motion_vectors);
+                           ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           if (SUCCEEDED(hr_vel))
+                           {
+                              hr_vel = native_device->CreateRenderTargetView(game_device_data.sr_motion_vectors.get(), nullptr, &game_device_data.sr_motion_vectors_rtv);
+                              ASSERT_ONCE(SUCCEEDED(hr_vel));
+                           }
+                        }
+                     }
+                  }
+                  if (game_device_data.sr_motion_vectors.get())
+                  {
+                     DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+                     DrawStateStack<DrawStateStackType::Compute> compute_state_stack;
+                     draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                     compute_state_stack.Cache(native_device_context, device_data.uav_max_count);
+                     if (!updated_cbuffers)
+                     {
+                        constexpr bool do_safety_checks = false; // No need to check as we cache the states and restore them.
+                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings, 0, 0, 0.f, 0.f, do_safety_checks);
+                        SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData, 0, 0, 0.f, 0.f, do_safety_checks);
+                     }
+                     DecodeMotionVectors(is_compute_shader, native_device_context, device_data, taa_shader_info);
+                     draw_state_stack.Restore(native_device_context);
+                     compute_state_stack.Restore(native_device_context);
+                  }
+               }
+               // The game's own TAA still has to run: it produces the image that
+               // the later upscale pass consumes.
+               return DrawOrDispatchOverrideType::None;
+            }
+
             com_ptr<ID3D11Resource> output_color_resource;
             if (is_compute_shader)
                unordered_access_views[0]->GetResource(&output_color_resource);
@@ -905,21 +1288,42 @@ public:
             native_device_context->RSGetViewports(&num_viewports, &viewport);
             // game_device_data.viewport_rect         = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height};
             // game_device_data.render_resolution     = {(float)taa_output_texture_desc.Width, (float)taa_output_texture_desc.Height, 1.0f / (float)taa_output_texture_desc.Width, 1.0f / (float)taa_output_texture_desc.Height};
-            device_data.sr_render_resolution_scale = 1.0f; // DLAA only
+            // --- DLSS input: the game's TAA source color, native TAA resolution (DLAA) ---
+            // UE4 performs the ScreenPercentage upscale in a *later* pass, so the
+            // TAA slot exposed here is internal-res -> internal-res: replacing it
+            // can only yield DLAA. Downscaling the input to fake super-resolution
+            // (v4) was measured and discarded: no performance win (the game still
+            // shades at full internal res), worse image quality from the extra
+            // resample, and it corrupted the in-game UI on resolution changes.
+            uint32_t sr_declared_render_w = taa_output_texture_desc.Width;
+            uint32_t sr_declared_render_h = taa_output_texture_desc.Height;
+            game_device_data.sr_source_color = nullptr;
+            shader_resources[taa_shader_info.source_texture_register]->GetResource(&game_device_data.sr_source_color);
+            // DLAA: the declared render size equals the TAA resolution. The
+            // value below is only used for the overlay readout.
+            device_data.sr_render_resolution_scale = 1.0f;
 
             SR::SettingsData settings_data;
             settings_data.output_width = taa_output_texture_desc.Width;
             settings_data.output_height = taa_output_texture_desc.Height;
-            settings_data.render_width = game_device_data.render_resolution.x;
-            settings_data.render_height = game_device_data.render_resolution.y;
+            // Declared render size = the actual DLSS input texture size (the
+            // game's TAA source color). This must match the real texture:
+            // declaring a larger size makes NGX return FAIL_InvalidParameter
+            // (BAD00005) every frame and the replaced pass stays black.
+            settings_data.render_width = sr_declared_render_w;
+            settings_data.render_height = sr_declared_render_h;
             settings_data.dynamic_resolution = true;
             settings_data.hdr = true; // Unreal Engine does DLSS before tonemapping, in HDR linear space
             settings_data.inverted_depth = true;
             settings_data.mvs_jittered = false;
             settings_data.auto_exposure = sr_auto_exposure; // Unreal Engine does TAA before tonemapping
             settings_data.render_preset = dlss_render_preset;
-            settings_data.mvs_x_scale = 1.0f;
-            settings_data.mvs_y_scale = 1.0f;
+            // MVs are generated at the TAA resolution in pixel units of that
+            // resolution; DLSS expects input-resolution pixels. Input and TAA
+            // resolution are identical here (DLAA) so the scale is 1.0, but be
+            // kept in this form so it stays correct if they ever diverge.
+            settings_data.mvs_x_scale = (float)settings_data.render_width / (float)taa_output_texture_desc.Width;
+            settings_data.mvs_y_scale = (float)settings_data.render_height / (float)taa_output_texture_desc.Height;
             sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
             constexpr bool dlss_use_native_uav = true;
@@ -960,8 +1364,6 @@ public:
             }
             if (!skip_dlss)
             {
-               game_device_data.sr_source_color = nullptr;
-               shader_resources[taa_shader_info.source_texture_register]->GetResource(&game_device_data.sr_source_color);
                game_device_data.depth_buffer = nullptr;
                shader_resources[taa_shader_info.depth_texture_register]->GetResource(&game_device_data.depth_buffer);
                com_ptr<ID3D11Resource> object_velocity;
@@ -1059,11 +1461,16 @@ public:
                draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.depth_buffer.get();
                draw_data.pre_exposure = 0.0f; // automatic exposure
-               draw_data.jitter_x = game_device_data.jitter.x * game_device_data.render_resolution.x * 0.5f;
-               draw_data.jitter_y = game_device_data.jitter.y * game_device_data.render_resolution.y * -0.5f;
+               // Jitter offset must be in DLSS input pixels, not in the stale
+               // game_device_data.render_resolution (only set once at init).
+               draw_data.jitter_x = game_device_data.jitter.x * settings_data.render_width * 0.5f;
+               draw_data.jitter_y = game_device_data.jitter.y * settings_data.render_height * -0.5f;
                draw_data.reset = reset_sr;
-               draw_data.render_width = game_device_data.render_resolution.x;
-               draw_data.render_height = game_device_data.render_resolution.y;
+               // Must match the actual DLSS input texture (the TAA source color)
+               // and the declared render size: InRenderSubrectDimensions that
+               // exceeds the input texture makes NGX return InvalidParameter.
+               draw_data.render_width = settings_data.render_width;
+               draw_data.render_height = settings_data.render_height;
                draw_data.near_plane = game_device_data.near_plane / 100.0f;
                draw_data.far_plane = FLT_MAX; // TODO: made up values
                draw_data.vert_fov = game_device_data.fov_y;
@@ -1522,7 +1929,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 {
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
-      Globals::SetGlobals(PROJECT_NAME, "Unreal Engine Generic Luma mod");
+      Globals::SetGlobals(PROJECT_NAME, "Snowbreak Containment Zone Luma mod");
       Globals::VERSION = 1;
 
       cb_default_game_settings.HDRHighlightsHuePreservation = 0.667f;

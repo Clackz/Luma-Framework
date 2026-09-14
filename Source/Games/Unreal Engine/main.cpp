@@ -46,13 +46,19 @@ namespace
       reshade::log::message(reshade::log::level::warning, std::format("UE4-UPSCALE: IN {}x{} OUT {}x{} fmt {}", in_w, in_h, out_w, out_h, (int)fmt).c_str());
    }
 
+   // Number of UpdateSettings calls actually forwarded to OptiScaler. The
+   // eleven compared fields only change on a real render-size/render-state
+   // move, so this should stay near the number of distinct settings tuples -
+   // not the ~80/s the pass itself runs at.
+   static uint64_t sr_update_calls = 0;
+
    // SR::SettingsData::operator== compares eleven fields, but OptiScaler's log
    // only prints the render/display sizes, so a change in any of the others is
    // invisible there while still forcing UpdateSettings to release and rebuild
-   // the NGX feature. Dump the full tuple once per distinct combination plus how
-   // many times the pass has run, so a rebuild that these settings did NOT ask
-   // for can be told apart from one they did.
-   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h)
+   // the NGX feature. Dump the full tuple once per distinct combination, plus
+   // the raw motion-vector size and whether it was accepted, so a rebuild that
+   // these settings did NOT ask for can be told apart from one they did.
+   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used)
    {
       static SR::SettingsData seen[32];
       static int seen_n = 0;
@@ -66,10 +72,33 @@ namespace
       if (seen_n < 32)
          seen[seen_n++] = s;
       reshade::log::message(reshade::log::level::warning, std::format(
-         "UE4-SRSTATE#{} calls={}: in {}x{} out {}x{} mv {}x{} mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
-         seen_n, calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
-         s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
+         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
+         seen_n, calls, sr_update_calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
+         mv_used ? "used" : "stale", s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
          (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset).c_str());
+   }
+
+   // The upscale pass is only a resolution change when input and output share
+   // the aspect ratio. Loads of other combinations reach the same shader, so
+   // log the first sighting of each rejected one: they explain both the cases
+   // SR is skipped in and, if a "zoomed in" report follows, which pass did it.
+   static inline void LogUpscaleSkip(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h, const char* reason)
+   {
+      static uint32_t seen_dim[32][4];
+      static int seen_n = 0;
+      if (seen_n >= 32)
+         return;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen_dim[i][0] == in_w && seen_dim[i][1] == in_h && seen_dim[i][2] == out_w && seen_dim[i][3] == out_h)
+            return;
+      }
+      seen_dim[seen_n][0] = in_w;
+      seen_dim[seen_n][1] = in_h;
+      seen_dim[seen_n][2] = out_w;
+      seen_dim[seen_n][3] = out_h;
+      seen_n++;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-SKIP: {} IN {}x{} OUT {}x{}", reason, in_w, in_h, out_w, out_h).c_str());
    }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
@@ -663,7 +692,22 @@ public:
 
                   LogUpscalePass(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height, upscale_input_desc.Format);
 
-                  if (upscale_input_desc.Width > 0 && upscale_input_desc.Height > 0 &&
+                  // A plain ScreenPercentage upscale only rescales, so its input
+                  // and output must share the aspect ratio. When they do not -
+                  // 1920x1280 into 2560x1440, seen right after leaving a battle
+                  // for the hub - this pass is instead blitting a *subrect* of
+                  // its input, which is what cb0[34] clamps the UVs to. Feeding
+                  // the whole texture to NGX magnifies that subrect: that is the
+                  // "the hub is zoomed in" report. Anything that is not a pure
+                  // aspect-preserving rescale is left to the game's own pass.
+                  const bool upscale_is_plain_rescale =
+                     (uint64_t)upscale_input_desc.Width * upscale_output_desc.Height ==
+                     (uint64_t)upscale_input_desc.Height * upscale_output_desc.Width;
+                  if (!upscale_is_plain_rescale)
+                     LogUpscaleSkip(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height, "aspect");
+
+                  if (upscale_is_plain_rescale &&
+                      upscale_input_desc.Width > 0 && upscale_input_desc.Height > 0 &&
                       upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
                   {
                      auto* sr_instance_data = device_data.GetSRInstanceData();
@@ -697,15 +741,44 @@ public:
                         D3D11_TEXTURE2D_DESC mv_texture_desc = {};
                         if (game_device_data.sr_motion_vectors.get())
                            game_device_data.sr_motion_vectors->GetDesc(&mv_texture_desc);
-                        if (mv_texture_desc.Width && mv_texture_desc.Height)
+                        // UE4 substitutes a 1x1 placeholder for the velocity
+                        // target on frames that never ran a velocity pass at all
+                        // (menus, pause, map transitions). The previous "both
+                        // dimensions non-zero" test accepted it and derived
+                        // 1920x1080 / 1x1 = 1920.0/1080.0 - which differs from
+                        // the usual 1.0/1.0 by exactly the render scale.
+                        // SR::SettingsData compares the ratio, so every flip
+                        // between those two values made OptiScaler release and
+                        // rebuild the NGX feature (measured: CreateFeature, 8ms,
+                        // ReleaseFeature, then the same again 500ms later), which
+                        // is the periodic hitching in fights. Only a plausible
+                        // texture may move the ratio; otherwise the last valid
+                        // value is kept.
+                        const bool mv_size_plausible =
+                           mv_texture_desc.Width > 4 && mv_texture_desc.Height > 4 &&
+                           mv_texture_desc.Width <= upscale_input_desc.Width && mv_texture_desc.Height <= upscale_input_desc.Height;
+                        if (mv_size_plausible)
                         {
                            sr_mvs_x_scale = (float)upscale_input_desc.Width / (float)mv_texture_desc.Width;
                            sr_mvs_y_scale = (float)upscale_input_desc.Height / (float)mv_texture_desc.Height;
                         }
                         settings_data.mvs_x_scale = sr_mvs_x_scale;
                         settings_data.mvs_y_scale = sr_mvs_y_scale;
-                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height);
-                        sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mv_size_plausible);
+                        // Hand OptiScaler a change only when one of the eleven
+                        // compared fields actually moved. Re-sending an
+                        // identical tuple is a no-op for it but the comparison
+                        // itself runs on every one of the ~80 calls/s this pass
+                        // makes.
+                        static SR::SettingsData sr_last_settings;
+                        static bool sr_last_settings_valid = false;
+                        if (!sr_last_settings_valid || !(sr_last_settings == settings_data))
+                        {
+                           sr_last_settings = settings_data;
+                           sr_last_settings_valid = true;
+                           sr_update_calls++;
+                           sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+                        }
 
                         constexpr bool sr_use_native_uav = true;
                         bool sr_output_supports_uav = sr_use_native_uav && (upscale_output_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;

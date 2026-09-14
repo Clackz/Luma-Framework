@@ -27,10 +27,10 @@ jobs:
       - name: Build ReShade.sln Release x64
         run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
 
-      # Build only the Unreal Engine addon (main.cpp + Core unity_build.cpp are
+      # Build only the Snowbreak Containment Zone addon (main.cpp + Core unity_build.cpp are
       # compiled in this project; there are no project references). No
       # continue-on-error: a compile error must fail the run loudly.
-      - name: Build Unreal Engine addon (Test-Release x64)
+      - name: Build Snowbreak Containment Zone addon (Test-Release x64)
         shell: pwsh
         run: |
           msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Test-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
@@ -40,7 +40,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
-      - name: Package Unreal Engine addon
+      - name: Package Snowbreak Containment Zone addon
         shell: pwsh
         run: |
           pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Test-Release" -Platform "x64" -OutDir "."

@@ -45,6 +45,32 @@ namespace
       seen_n++;
       reshade::log::message(reshade::log::level::warning, std::format("UE4-UPSCALE: IN {}x{} OUT {}x{} fmt {}", in_w, in_h, out_w, out_h, (int)fmt).c_str());
    }
+
+   // SR::SettingsData::operator== compares eleven fields, but OptiScaler's log
+   // only prints the render/display sizes, so a change in any of the others is
+   // invisible there while still forcing UpdateSettings to release and rebuild
+   // the NGX feature. Dump the full tuple once per distinct combination plus how
+   // many times the pass has run, so a rebuild that these settings did NOT ask
+   // for can be told apart from one they did.
+   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h)
+   {
+      static SR::SettingsData seen[32];
+      static int seen_n = 0;
+      static uint64_t calls = 0;
+      calls++;
+      for (int i = 0; i < seen_n; i++)
+      {
+         if (seen[i] == s)
+            return;
+      }
+      if (seen_n < 32)
+         seen[seen_n++] = s;
+      reshade::log::message(reshade::log::level::warning, std::format(
+         "UE4-SRSTATE#{} calls={}: in {}x{} out {}x{} mv {}x{} mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
+         seen_n, calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
+         s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
+         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset).c_str());
+   }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
    std::shared_mutex ssao_mutex;      // Added mutex for SSAO info
@@ -661,10 +687,24 @@ public:
                         // Motion vectors live at the TAA resolution and are expressed
                         // in pixels of that resolution, while the declared render
                         // size is the (possibly lower) internal resolution.
-                        D3D11_TEXTURE2D_DESC mv_texture_desc;
-                        game_device_data.sr_motion_vectors->GetDesc(&mv_texture_desc);
-                        settings_data.mvs_x_scale = mv_texture_desc.Width ? (float)upscale_input_desc.Width / (float)mv_texture_desc.Width : 1.0f;
-                        settings_data.mvs_y_scale = mv_texture_desc.Height ? (float)upscale_input_desc.Height / (float)mv_texture_desc.Height : 1.0f;
+                        // The ratio is one of the eleven fields SR::SettingsData
+                        // compares, so any instability here releases and rebuilds
+                        // the NGX feature. Keep the last valid ratio and reuse it
+                        // when the MV texture is momentarily absent, rather than
+                        // flipping to a different number for a frame.
+                        static float sr_mvs_x_scale = 1.0f;
+                        static float sr_mvs_y_scale = 1.0f;
+                        D3D11_TEXTURE2D_DESC mv_texture_desc = {};
+                        if (game_device_data.sr_motion_vectors.get())
+                           game_device_data.sr_motion_vectors->GetDesc(&mv_texture_desc);
+                        if (mv_texture_desc.Width && mv_texture_desc.Height)
+                        {
+                           sr_mvs_x_scale = (float)upscale_input_desc.Width / (float)mv_texture_desc.Width;
+                           sr_mvs_y_scale = (float)upscale_input_desc.Height / (float)mv_texture_desc.Height;
+                        }
+                        settings_data.mvs_x_scale = sr_mvs_x_scale;
+                        settings_data.mvs_y_scale = sr_mvs_y_scale;
+                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height);
                         sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
                         constexpr bool sr_use_native_uav = true;

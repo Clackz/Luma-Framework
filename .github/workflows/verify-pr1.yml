@@ -26,19 +26,18 @@ jobs:
       - name: Build ReShade.sln Release x64
         run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
 
+      # Build the project file directly: "msbuild Luma.sln /t:<name>" does not
+      # select a single solution project when the name contains spaces, it
+      # forwards the name as a target to every project in the solution.
       # No continue-on-error: a compile error must fail the run loudly.
       - name: Build Unreal Engine addon (Publishing-Release x64)
         shell: pwsh
         run: |
-          msbuild Luma.sln /t:"Unreal Engine" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
-            msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          }
+          msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Build Unreal Engine addon (Development-Release x64, asserts on)
         shell: pwsh
         run: |
-          msbuild Luma.sln /t:"Unreal Engine" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
           if ($LASTEXITCODE -ne 0) { exit 1 }

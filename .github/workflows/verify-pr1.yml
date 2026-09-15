@@ -1,0 +1,44 @@
+name: Verify Unreal Engine build (PR1 scaffolding)
+
+# Temporary workflow, used only to prove the Unreal Engine project still compiles
+# with the changes proposed for upstream. Not part of the pull request itself.
+on:
+  push:
+
+jobs:
+  build-ue:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      # Only the 64-bit ReShade build is needed, the addon is x64.
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      # No continue-on-error: a compile error must fail the run loudly.
+      - name: Build Unreal Engine addon (Publishing-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Unreal Engine" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Build Unreal Engine addon (Development-Release x64, asserts on)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Unreal Engine" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) { exit 1 }

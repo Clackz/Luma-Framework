@@ -30,33 +30,43 @@ jobs:
       # Build only the Snowbreak Containment Zone addon (main.cpp + Core unity_build.cpp are
       # compiled in this project; there are no project references). No
       # continue-on-error: a compile error must fail the run loudly.
-      - name: Build Snowbreak Containment Zone addon (Test-Release x64)
+      #
+      # Publishing-Release on purpose - it is the configuration Luma ships publicly. It does
+      # not define TEST/DEVELOPMENT, so the asserts that only exist in those configs are
+      # compiled out and can no longer pop a modal "Assertion failed" message box mid-game
+      # (e.g. the AreFormatsCopyCompatible one in core.hpp's MSAA resolve path - upstream
+      # code, harmless, but it blocks the render thread while the box is open).
+      # Our own UE4-UPSCALE / UE4-SRSTATE / UE4-SKIP diagnostics sit under #if ENABLE_SR and
+      # are not affected by the configuration, so nothing is lost by dropping TEST.
+      # Note: like TEST, Publishing loads shaders from <game>/Luma/<Project>/, so the shader
+      # mount does not change.
+      - name: Build Snowbreak Containment Zone addon (Publishing-Release x64)
         shell: pwsh
         run: |
-          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Test-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
-            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Test-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
       - name: Package Snowbreak Containment Zone addon
         shell: pwsh
         run: |
-          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Test-Release" -Platform "x64" -OutDir "."
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Publishing-Release" -Platform "x64" -OutDir "."
 
       - name: Verify output exists
         shell: pwsh
         run: |
-          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone-Test.zip")) {
-            Write-Host "::error::Luma-Snowbreak_Containment_Zone-Test.zip was not produced!"
+          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
+            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
             exit 1
           }
-          Get-Item "Luma-Snowbreak_Containment_Zone-Test.zip" | Select-Object Name, Length
+          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Luma-Snowbreak-Test
-          path: Luma-Snowbreak_Containment_Zone-Test.zip
+          name: Luma-Snowbreak
+          path: Luma-Snowbreak_Containment_Zone.zip
           if-no-files-found: error

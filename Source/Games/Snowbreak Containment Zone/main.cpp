@@ -1053,6 +1053,52 @@ public:
             native_device_context->CSGetShaderResources(0, ARRAYSIZE(shader_resources), &shader_resources[0]);
          else
             native_device_context->PSGetShaderResources(0, ARRAYSIZE(shader_resources), &shader_resources[0]);
+
+         // Size the TAA input/output textures are expected to be. They match the pass' own
+         // render target, which UE4 allocates at the *internal* render resolution, so anything
+         // smaller belongs to a different pass.
+         //
+         // "device_data.render_resolution" would be the natural reference for that, but it is
+         // only refreshed once the per-view global cbuffer has been located. When that lookup
+         // never succeeds for a game it keeps holding the *swapchain* size, and since UE4 renders
+         // smaller than the swapchain whenever "r.ScreenPercentage < 100", this gate then rejects
+         // every single TAA texture: TAA could only ever be confirmed while the game happened to
+         // render at 100%. DLSS therefore stayed off until the player opened the resolution
+         // settings (the display mode change passes through 100% for one frame) and was off again
+         // after a restart. Take the size from the pass itself instead.
+         uint32_t taa_pass_width = (uint32_t)device_data.render_resolution.x;
+         uint32_t taa_pass_height = (uint32_t)device_data.render_resolution.y;
+         {
+            com_ptr<ID3D11Resource> taa_pass_resource;
+            if (is_compute_shader)
+            {
+               com_ptr<ID3D11UnorderedAccessView> taa_pass_uav;
+               native_device_context->CSGetUnorderedAccessViews(0, 1, &taa_pass_uav);
+               if (taa_pass_uav != nullptr)
+                  taa_pass_uav->GetResource(&taa_pass_resource);
+            }
+            else
+            {
+               com_ptr<ID3D11RenderTargetView> taa_pass_rtv;
+               native_device_context->OMGetRenderTargets(1, &taa_pass_rtv, nullptr);
+               if (taa_pass_rtv != nullptr)
+                  taa_pass_rtv->GetResource(&taa_pass_resource);
+            }
+            if (taa_pass_resource != nullptr)
+            {
+               com_ptr<ID3D11Texture2D> taa_pass_texture;
+               if (SUCCEEDED(taa_pass_resource->QueryInterface(&taa_pass_texture)))
+               {
+                  D3D11_TEXTURE2D_DESC taa_pass_desc;
+                  taa_pass_texture->GetDesc(&taa_pass_desc);
+                  if (taa_pass_desc.Width > 0 && taa_pass_desc.Height > 0)
+                  {
+                     taa_pass_width = taa_pass_desc.Width;
+                     taa_pass_height = taa_pass_desc.Height;
+                  }
+               }
+            }
+         }
          size_t color_texture_count = 0;
          size_t depth_texture_count = 0;
          size_t velocity_texture_count = 0;
@@ -1077,7 +1123,7 @@ public:
 
             if (std::fabs(output_aspect_ratio - swapchain_aspect_ratio) > FLT_EPSILON)
                continue;
-            if (desc.Width < device_data.render_resolution.x || desc.Height < device_data.render_resolution.y)
+            if (desc.Width < taa_pass_width || desc.Height < taa_pass_height)
                continue;
 
             switch (desc.Format)

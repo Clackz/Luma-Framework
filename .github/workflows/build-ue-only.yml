@@ -1,9 +1,24 @@
 name: Build UE Mod Only
 
+# Fork-only workflow (`Clackz/Luma-Framework`).
+#
+# Upstream still ships every game through `build_and_release.yml` (4 configurations
+# x 2 platforms, ~39 minutes). This fork only ever needs the single Snowbreak:
+# Containment Zone addon, so that matrix is disabled here and this workflow is the
+# only one that builds and publishes anything.
+#
+# Push to `main` -> build only, the packaged zip stays an Actions artifact.
+# Manual run    -> build, then create a GitHub Release carrying the zip.
+
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub Release with the packaged addon (uncheck to only produce the Actions artifact)'
+        type: boolean
+        default: true
 
 jobs:
   build-ue-test:
@@ -70,3 +85,53 @@ jobs:
           name: Luma-Snowbreak
           path: Luma-Snowbreak_Containment_Zone.zip
           if-no-files-found: error
+
+  # Publishes the zip produced above as a GitHub Release.
+  #
+  # Only runs on a manual dispatch with the "release" input left checked. A normal
+  # push to main never creates a release, so routine commits do not spawn a new
+  # version number every time.
+  #
+  # `permissions: contents: write` is required: this repository defaults to read-only
+  # workflow permissions, and no PAT secret is configured (the token input of
+  # action-gh-release falls back to the automatic github.token, which only gains
+  # write access through this block).
+  release:
+    name: Publish Release
+    needs: build-ue-test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged addon
+        uses: actions/download-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: dist
+
+      - name: Inspect payload
+        run: ls -l dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-${{ github.run_number }}
+          name: Release (Build ${{ github.run_number }})
+          body: |
+            Luma for **Snowbreak: Containment Zone** - fork build, x64 addon only.
+
+            - Built from commit ${{ github.sha }}
+            - Configuration: `Publishing-Release` / `x64`
+            - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files
+
+            Installation
+            ------------
+            1. Extract the archive directly into the game folder (the one containing the game executable), replacing the previous files when updating.
+            2. Boot the game and press `Home` to bring up the ReShade and Luma menus. If they do not appear, ReShade or Luma failed to load.
+
+            This release only contains this game's mod. It is not the full multi-game Luma package.
+          files: |
+            dist/Luma-Snowbreak_Containment_Zone.zip
+          draft: false
+          prerelease: false

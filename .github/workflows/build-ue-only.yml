@@ -1,0 +1,142 @@
+name: Build UE Mod Only
+
+# Fork-only workflow (`Clackz/Luma-Framework`).
+#
+# Upstream still ships every game through `build_and_release.yml` (4 configurations
+# x 2 platforms, ~39 minutes). This fork only ever needs the single Snowbreak:
+# Containment Zone addon, so that matrix is disabled here and this workflow is the
+# only one that builds and publishes anything.
+#
+# Push to `main` -> build only, the packaged zip stays an Actions artifact.
+# Manual run    -> build, then create a GitHub Release carrying the zip.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub Release with the packaged addon (uncheck to only produce the Actions artifact)'
+        type: boolean
+        default: true
+
+jobs:
+  build-ue-test:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll
+      # as dxgi.dll for the x64 addon. The 32-bit build is skipped on purpose.
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      # Build only the Snowbreak Containment Zone addon (main.cpp + Core unity_build.cpp are
+      # compiled in this project; there are no project references). No
+      # continue-on-error: a compile error must fail the run loudly.
+      #
+      # Publishing-Release on purpose - it is the configuration Luma ships publicly. It does
+      # not define TEST/DEVELOPMENT, so the asserts that only exist in those configs are
+      # compiled out and can no longer pop a modal "Assertion failed" message box mid-game
+      # (e.g. the AreFormatsCopyCompatible one in core.hpp's MSAA resolve path - upstream
+      # code, harmless, but it blocks the render thread while the box is open).
+      # Our own UE4-UPSCALE / UE4-SRSTATE / UE4-SKIP diagnostics sit under #if ENABLE_SR and
+      # are not affected by the configuration, so nothing is lost by dropping TEST.
+      # Note: like TEST, Publishing loads shaders from <game>/Luma/<Project>/, so the shader
+      # mount does not change.
+      - name: Build Snowbreak Containment Zone addon (Publishing-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Package Snowbreak Containment Zone addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Publishing-Release" -Platform "x64" -OutDir "."
+
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
+            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
+            exit 1
+          }
+          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: Luma-Snowbreak_Containment_Zone.zip
+          if-no-files-found: error
+
+  # Publishes the zip produced above as a GitHub Release.
+  #
+  # Only runs on a manual dispatch with the "release" input left checked. A normal
+  # push to main never creates a release, so routine commits do not spawn a new
+  # version number every time.
+  #
+  # `permissions: contents: write` is required: this repository defaults to read-only
+  # workflow permissions, and no PAT secret is configured (the token input of
+  # action-gh-release falls back to the automatic github.token, which only gains
+  # write access through this block).
+  release:
+    name: Publish Release
+    needs: build-ue-test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged addon
+        uses: actions/download-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: dist
+
+      - name: Inspect payload
+        run: ls -l dist
+
+      # The tag deliberately lives in its own `snowbreak-<n>` namespace instead of the
+      # upstream `latest-<n>` scheme: this repository still carries ~350 orphaned
+      # `latest-*` tags from earlier full-matrix runs, and reusing that namespace would
+      # make the run number collide with an existing tag - action-gh-release would then
+      # attach the new release to whatever commit that old tag points at.
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snowbreak-${{ github.run_number }}
+          name: Release (Build ${{ github.run_number }})
+          body: |
+            Luma for **Snowbreak: Containment Zone** - fork build, x64 addon only.
+
+            - Built from commit ${{ github.sha }}
+            - Configuration: `Publishing-Release` / `x64`
+            - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files
+
+            Installation
+            ------------
+            1. Extract the archive directly into the game folder (the one containing the game executable), replacing the previous files when updating.
+            2. Boot the game and press `Home` to bring up the ReShade and Luma menus. If they do not appear, ReShade or Luma failed to load.
+
+            This release only contains this game's mod. It is not the full multi-game Luma package.
+          files: |
+            dist/Luma-Snowbreak_Containment_Zone.zip
+          draft: false
+          prerelease: false

@@ -19,6 +19,14 @@ on:
         description: 'Publish a GitHub Release with the packaged addon (uncheck to only produce the Actions artifact)'
         type: boolean
         default: true
+      nexus:
+        description: 'Also build the Nexus-ready package (drops dxgi.dll / nvngx_dlss.dll, adds LICENSE + attribution)'
+        type: boolean
+        default: true
+      nexus_version:
+        description: 'Version string used to name the Nexus package'
+        type: string
+        default: '1.0'
 
 jobs:
   build-ue-test:
@@ -86,6 +94,241 @@ jobs:
           path: Luma-Snowbreak_Containment_Zone.zip
           if-no-files-found: error
 
+  # Builds the archive we actually upload to Nexus, out of the one built above.
+  #
+  # The upstream packaging (Scripts/package.ps1) always drops its own ReShade build in as
+  # dxgi.dll, plus the NGX DLSS runtime when the project opts into UseLumaNGX. Neither
+  # belongs in a Nexus upload: dxgi.dll would take the proxy slot the user's own loader or
+  # OptiScaler already holds (silently overwriting a working ReShade install), and the
+  # ~58 MB NVIDIA runtime is something the user already has a newer copy of beside the game
+  # executable. So this job does not rebuild anything - it filters that archive, adds the
+  # licence and attribution the Luma licence requires for redistribution, records where the
+  # build came from, and fails closed if any file outside the allow-list survives.
+  nexus-package:
+    name: Build Nexus Package
+    needs: build-ue-test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.nexus == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Only the licence text is needed from the repository; the mod comes from the artifact.
+      - name: Checkout LICENSE.md
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: LICENSE.md
+          sparse-checkout-cone-mode: false
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: dist
+
+      # Note on indentation: a YAML block scalar takes its indentation from its first line, so
+      # the `@'` / `'@` pair below sits at exactly that level and therefore lands in column 0
+      # of the real script - PowerShell requires the closing quote to start a line.
+      - name: Filter and repack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = "${{ inputs.nexus_version }}"
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "0.0" }
+
+          $sourceZip = Get-ChildItem -Path dist -Filter *.zip -File | Sort-Object Name | Select-Object -First 1
+          if (-not $sourceZip) {
+            Write-Host "::error::no packaged zip found under dist/"
+            exit 1
+          }
+          Write-Host "Source archive: $($sourceZip.Name) ($($sourceZip.Length) bytes)"
+
+          $stage = Join-Path $PWD "nexus-stage"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Expand-Archive -LiteralPath $sourceZip.FullName -DestinationPath $stage -Force
+
+          # 1. Drop what must never be redistributed.
+          $banned = @(
+            "dxgi.dll", "d3d11.dll", "d3d12.dll", "winmm.dll", "version.dll", "dinput8.dll",
+            "nvngx_dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssg.dll", "nvngx.dll"
+          )
+          $dropped = @()
+          foreach ($name in $banned) {
+            Get-ChildItem -Path $stage -Recurse -File -Filter $name | ForEach-Object {
+              $dropped += $_.FullName.Substring($stage.Length).TrimStart('\', '/')
+              Remove-Item -LiteralPath $_.FullName -Force
+            }
+          }
+          if ($dropped.Count -eq 0) {
+            Write-Host "::warning::nothing was dropped - did upstream stop shipping dxgi.dll / nvngx_dlss.dll?"
+          } else {
+            $dropped | ForEach-Object { Write-Host "  dropped: $_" }
+          }
+
+          # 2. What is left still has to be a working mod.
+          $addon = @(Get-ChildItem -Path $stage -Filter *.addon -File)
+          if ($addon.Count -ne 1) {
+            Write-Host "::error::expected exactly one .addon at the archive root, found $($addon.Count)"
+            exit 1
+          }
+          foreach ($mount in @("Luma/Global", "Luma/Includes", "Luma/Snowbreak Containment Zone")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $mount))) {
+              Write-Host "::error::missing shader mount: $mount"
+              exit 1
+            }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $stage "Luma/d3dcompiler_47.dll"))) {
+            Write-Host "::error::Luma/d3dcompiler_47.dll is missing - the mod cannot compile its shaders without it"
+            exit 1
+          }
+
+          # 3. Licence and attribution travel with the archive. The Luma licence allows
+          #    redistribution with attribution and asks to be contacted first for commercial
+          #    use, so shipping the licence text and the credit is not optional.
+          Copy-Item -LiteralPath "LICENSE.md" -Destination (Join-Path $stage "LICENSE.md") -Force
+
+          $readme = @'
+          Luma for Snowbreak: Containment Zone
+          ====================================
+
+          What this is
+          ------------
+          Super Resolution (DLSS) for Snowbreak: Containment Zone. The game ships without any
+          DLSS support at all, and this build adds it. It is a build of the Luma Framework
+          running as a ReShade add-on, packaged for Nexus.
+
+          Contents
+          --------
+            Luma-Snowbreak Containment Zone.addon
+                the mod itself
+            Luma/Global/ , Luma/Includes/ , Luma/Snowbreak Containment Zone/
+                the shaders the mod mounts when it runs
+            Luma/d3dcompiler_47.dll
+                shader compiler the mod uses at runtime
+            LICENSE.md
+                the licence of the code this build is made from
+            SHA256SUMS.txt
+                SHA-256 of every file in this archive
+            build-info.txt
+                which commit this build came from, and what it was built with
+
+          Requirements
+          ------------
+          ReShade 6.x or newer, with add-on support, must already be installed for the game.
+          This archive deliberately does NOT contain ReShade. ReShade loads from a fixed slot,
+          usually dxgi.dll, and that slot may already be taken by an existing ReShade install
+          or by another tool such as OptiScaler. Writing our own copy there would silently
+          overwrite whatever the user already has working.
+
+          Installation
+          ------------
+          1. Confirm the ReShade overlay opens in game (Home key).
+          2. Extract this archive into the folder that holds the game executable, merging
+             folders and replacing files when updating.
+          3. Launch the game and press Home. The add-on list should now contain Luma.
+          4. Open the Luma tab and set Super Resolution to DLSS.
+
+          Notes
+          -----
+          * Luma's HDR remastering is switched off in this build on purpose. With it enabled,
+            leaving a stage and returning to the main lobby kept the loading screen frozen for
+            around 29 seconds before the world rendered, even though the game itself kept
+            running at full frame rate. Disabling it removes the freeze. Until the root cause
+            is fixed this build does not expose the option at all.
+          * The first launch after installing or updating compiles the mod's shaders and is
+            slower than usual. Later launches are not.
+          * If you run OptiScaler as well, do not let either tool replace the other's proxy.
+
+          Credits and licence
+          -------------------
+          This is a build of the Luma Framework by Filippo Tarpini (Pumbo):
+          https://github.com/Filoppi/Luma-Framework
+          Used under its licence, which allows redistribution as long as the author is
+          credited, and requires asking the author first for commercial use. The full licence
+          text is in LICENSE.md, shipped in this archive.
+          The rendering work is all his. Only the game-specific preset for Snowbreak:
+          Containment Zone, its shaders mount, and the packaging of this archive are ours.
+
+          This mod is free. If you paid for it, you were overcharged.
+          '@
+          Set-Content -Path (Join-Path $stage "README.txt") -Value $readme -Encoding utf8
+
+          # 4. Provenance, so a build can always be traced back to a commit.
+          function Get-PeTimeStamp([string]$Path) {
+            try {
+              $fs = [System.IO.File]::OpenRead($Path)
+              try {
+                $br = New-Object System.IO.BinaryReader($fs)
+                $fs.Position = 0x3C
+                $peOffset = $br.ReadInt32()
+                $fs.Position = $peOffset + 8
+                $seconds = $br.ReadUInt32()
+                return ([DateTimeOffset]::FromUnixTimeSeconds($seconds)).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+              } finally { $fs.Dispose() }
+            } catch { return "unavailable" }
+          }
+
+          $peTs = Get-PeTimeStamp -Path $addon[0].FullName
+          $addonHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $addon[0].FullName).Hash.ToLowerInvariant()
+          $buildInfo = @(
+            "Luma for Snowbreak: Containment Zone - Nexus package",
+            "version:       $version",
+            "commit:        ${{ github.sha }}",
+            "ref:           ${{ github.ref_name }}",
+            "workflow run:  ${{ github.run_id }} (build ${{ github.run_number }})",
+            "configuration: Publishing-Release / x64 (not TEST, not DEVELOPMENT)",
+            "addon:         $($addon[0].Name)",
+            "addon size:    $($addon[0].Length) bytes",
+            "addon sha256:  $addonHash",
+            "addon PE TimeDateStamp: $peTs",
+            "generated:     $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          ) -join "`n"
+          Set-Content -Path (Join-Path $stage "build-info.txt") -Value $buildInfo -Encoding utf8
+
+          # 5. Checksums, written after everything else so the file cannot end up listing itself.
+          $sums = Get-ChildItem -Path $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = $_.FullName.Substring($stage.Length).TrimStart('\', '/') -replace '\\', '/'
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $rel"
+          }
+          Set-Content -Path (Join-Path $stage "SHA256SUMS.txt") -Value $sums -Encoding utf8
+
+          # 6. Fail closed. A file outside the allow-list means upstream changed the package
+          #    layout: stop and look at it rather than publish something nobody inspected.
+          $allowedExt = @(".addon", ".hlsl", ".hlsli", ".h", ".yml", ".txt", ".md")
+          $allowedDll = @("d3dcompiler_47.dll")
+          $unexpected = @()
+          foreach ($f in Get-ChildItem -Path $stage -Recurse -File) {
+            $rel = $f.FullName.Substring($stage.Length).TrimStart('\', '/') -replace '\\', '/'
+            $ok = $allowedExt -contains $f.Extension.ToLowerInvariant()
+            if (-not $ok -and $f.Extension -ieq ".dll") {
+              $ok = ($allowedDll -contains $f.Name) -and $rel.StartsWith("Luma/")
+            }
+            if (-not $ok) { $unexpected += $rel }
+          }
+          if ($unexpected.Count -gt 0) {
+            $unexpected | ForEach-Object { Write-Host "::error::unexpected file in package: $_" }
+            exit 1
+          }
+
+          Write-Host "Final contents:"
+          Get-ChildItem -Path $stage -Recurse -File | ForEach-Object {
+            Write-Host "  $($_.FullName.Substring($stage.Length).TrimStart('\', '/'))"
+          }
+
+          # 7. Zip.
+          $out = Join-Path $PWD "Luma-Snowbreak-Nexus-$version.zip"
+          Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $out -Force
+          $zip = Get-Item -LiteralPath $out
+          Write-Host "Nexus package: $($zip.Name) / $($zip.Length) bytes"
+          Write-Host "sha256: $((Get-FileHash -Algorithm SHA256 -LiteralPath $out).Hash.ToLowerInvariant())"
+
+      - name: Upload Nexus package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak-Nexus
+          path: Luma-Snowbreak-Nexus-*.zip
+          if-no-files-found: error
+
   # Publishes the zip produced above as a GitHub Release.
   #
   # Only runs on a manual dispatch with the "release" input left checked. A normal
@@ -110,6 +353,15 @@ jobs:
           name: Luma-Snowbreak
           path: dist
 
+      # Only exists when the "nexus" input was left checked. continue-on-error keeps an
+      # ordinary release working when it was not.
+      - name: Download Nexus package
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: Luma-Snowbreak-Nexus
+          path: dist
+
       - name: Inspect payload
         run: ls -l dist
 
@@ -130,6 +382,11 @@ jobs:
             - Configuration: `Publishing-Release` / `x64`
             - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files
 
+            Two archives are attached. They hold the same add-on and differ only in packaging:
+
+            - `Luma-Snowbreak_Containment_Zone.zip` - upstream-style package. Also carries ReShade as `dxgi.dll`, so it can be dropped into a game folder that has no ReShade yet.
+            - `Luma-Snowbreak-Nexus-<version>.zip` - for the Nexus upload. No `dxgi.dll` and no `nvngx_dlss.dll`, plus the licence text, a credit file and `SHA256SUMS.txt`.
+
             Installation
             ------------
             1. Extract the archive directly into the game folder (the one containing the game executable), replacing the previous files when updating.
@@ -137,6 +394,6 @@ jobs:
 
             This release only contains this game's mod. It is not the full multi-game Luma package.
           files: |
-            dist/Luma-Snowbreak_Containment_Zone.zip
+            dist/*.zip
           draft: false
           prerelease: false

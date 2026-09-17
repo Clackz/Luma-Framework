@@ -341,8 +341,19 @@ jobs:
   # write access through this block).
   release:
     name: Publish Release
-    needs: build-ue-test
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+    # NOTE: this job waits for BOTH upstream jobs. `nexus-package` is skipped unless the
+    # "nexus" input is set, and a job whose `needs` was skipped is skipped too - so the
+    # condition below has to defeat that with `always()`, guarded by an explicit check on
+    # build-ue-test's result so a failed build can never produce a release.
+    #
+    # This was a real bug, found by running it: with `needs: build-ue-test` alone this job
+    # started before `nexus-package` had uploaded its artifact, the Nexus download failed
+    # with "Artifact not found", `continue-on-error` swallowed the error, and the release
+    # went out with one archive while its body promised two (run 35239084950, tag
+    # snowbreak-22). `always()` is required precisely because a skipped `needs` would
+    # otherwise skip this job too, which is the common `nexus=false` dispatch.
+    needs: [build-ue-test, nexus-package]
+    if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true' && needs.build-ue-test.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -365,6 +376,20 @@ jobs:
       - name: Inspect payload
         run: ls -l dist
 
+      # Fail closed. The `continue-on-error` on the download above is what keeps an ordinary
+      # (nexus=false) dispatch working, and it is also exactly what hid the missing artifact
+      # in run 35239084950 - so when the Nexus package was requested, assert it is here.
+      - name: Verify the Nexus package is present when requested
+        if: github.event.inputs.nexus == 'true'
+        shell: bash
+        run: |
+          if ! ls dist/*Nexus*.zip >/dev/null 2>&1; then
+            echo "::error::nexus=true but dist/ holds no Nexus package - refusing to publish a release whose body promises two archives."
+            ls -l dist
+            exit 1
+          fi
+          ls -l dist/*Nexus*.zip
+
       # The tag deliberately lives in its own `snowbreak-<n>` namespace instead of the
       # upstream `latest-<n>` scheme: this repository still carries ~350 orphaned
       # `latest-*` tags from earlier full-matrix runs, and reusing that namespace would
@@ -382,7 +407,8 @@ jobs:
             - Configuration: `Publishing-Release` / `x64`
             - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files
 
-            Two archives are attached. They hold the same add-on and differ only in packaging:
+            The attached archives hold the same add-on and differ only in packaging. The second
+            one is produced when the build was dispatched with the Nexus option:
 
             - `Luma-Snowbreak_Containment_Zone.zip` - upstream-style package. Also carries ReShade as `dxgi.dll`, so it can be dropped into a game folder that has no ReShade yet.
             - `Luma-Snowbreak-Nexus-<version>.zip` - for the Nexus upload. No `dxgi.dll` and no `nvngx_dlss.dll`, plus the licence text, a credit file and `SHA256SUMS.txt`.

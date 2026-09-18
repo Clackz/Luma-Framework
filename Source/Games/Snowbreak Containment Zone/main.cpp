@@ -130,11 +130,14 @@ namespace
       bool enable_dithering_fix = false; // Master switch for dithering fix
       bool sr_auto_exposure = true;
 
-      // Luma HDR is intentionally unavailable for this game: enabling it turns on the swapchain scRGB +
-      // indirect texture format upgrade chain, which leaves the MainMap loading screen stuck for ~29s
-      // when leaving a dungeon (until the user presses ESC). Snowbreak outputs SDR (its swapchain is
-      // DXGI_FORMAT_R10G10B10A2_UNORM), so the vanilla path is both correct and stable.
-      // Measured 2026-09-17: EnableHDR=1 -> 28.885s vs EnableHDR=0 -> 6.480s for the same dungeon exit.
+      // Luma HDR is intentionally unavailable for this game, because of a bug: with it enabled, leaving
+      // a dungeon and returning to the main lobby could leave the loading screen stuck indefinitely -
+      // the game itself stays alive and at full frame rate underneath, and pressing ESC back out to the
+      // "main" lobby screen clears it about a second later. Switching Luma HDR off removes the problem
+      // (measured 2026-09-17), so the option is not exposed here at all. Snowbreak also outputs SDR (its
+      // swapchain is DXGI_FORMAT_R10G10B10A2_UNORM), so the vanilla path is what this game wants anyway.
+      // Root cause is not isolated yet; it is somewhere in what the HDR path turns on (the swapchain /
+      // texture format upgrade chain). Want HDR? Build from upstream, the option still exists there.
       bool enable_hdr = false; // See the note above: never true for this game
 
       CB::LumaGameSettings cb_default_game_settings;

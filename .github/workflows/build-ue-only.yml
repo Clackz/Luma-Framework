@@ -229,11 +229,19 @@ jobs:
 
           Notes
           -----
-          * Luma's HDR remastering is switched off in this build on purpose. With it enabled,
-            leaving a stage and returning to the main lobby kept the loading screen frozen for
-            around 29 seconds before the world rendered, even though the game itself kept
-            running at full frame rate. Disabling it removes the freeze. Until the root cause
-            is fixed this build does not expose the option at all.
+          * Luma's HDR remastering is not exposed in this build, because of a bug.
+            With it enabled, leaving a stage and returning to the main lobby could
+            leave the loading screen stuck, even though the game itself kept running
+            at full frame rate underneath. Switching it off removes the problem, so
+            the option is simply not there. The change is in the mod's source. If you
+            want HDR remastering, use an upstream Luma build instead - it still has
+            this bug.
+          * If you do get stuck on a loading screen after leaving a stage, press Esc a
+            few times to back out to the main lobby screen. The world starts rendering
+            about a second after the lobby screen is up, and the loading screen clears
+            with it. While you are still on the stage-result panels it does not clear on
+            its own - one run sat there for 99 seconds and never recovered. The game
+            itself stays alive and at full frame rate throughout.
           * The first launch after installing or updating compiles the mod's shaders and is
             slower than usual. Later launches are not.
           * If you run OptiScaler as well, do not let either tool replace the other's proxy.
@@ -249,6 +257,65 @@ jobs:
           Containment Zone, its shaders mount, and the packaging of this archive are ours.
 
           This mod is free. If you paid for it, you were overcharged.
+
+          中文说明
+          ========
+
+          这是什么
+          --------
+          《尘白禁区》（Snowbreak: Containment Zone）原生不支持 DLSS，本 mod 为其加入
+          DLSS 超分。它基于 Luma Framework，以 ReShade 插件的形式运行，本包为 Nexus
+          发布版。
+
+          包含内容
+          --------
+            Luma-Snowbreak Containment Zone.addon
+                mod 本体
+            Luma/Global/ 、Luma/Includes/ 、Luma/Snowbreak Containment Zone/
+                mod 运行时挂载的着色器
+            Luma/d3dcompiler_47.dll
+                mod 运行时使用的着色器编译器
+            LICENSE.md
+                本构建所基于代码的许可
+            SHA256SUMS.txt
+                本包内每个文件的 SHA-256
+            build-info.txt
+                本构建来自哪个 commit、用什么构建
+
+          前置要求
+          --------
+          需先为游戏装好 ReShade 6.x 或更新版本（带 add-on 支持）。本 mod 不含 ReShade。
+          ReShade 从固定槽位加载（通常是 dxgi.dll），该槽位可能已被你现有的 ReShade
+          或 OptiScaler 之类工具占用，写入我们自己的副本会覆盖掉你原本能用的那份。
+
+          安装
+          ----
+          1. 确认游戏内按 Home 能呼出 ReShade 面板。
+          2. 将本压缩包解压到游戏可执行文件所在目录，合并文件夹，更新时覆盖。
+          3. 启动游戏并按 Home，插件列表中应出现 Luma。
+          4. 打开 Luma 标签页，将 Super Resolution 设为 DLSS。
+
+          注意事项
+          --------
+          * 本版本未开放 Luma 的 HDR 重制，因为它存在 bug。开启时，退出副本回到主界面
+            可能一直卡在加载界面——游戏本身仍在满帧运行，但加载界面不消失。关闭后该
+            问题即消失，因此本版本不提供此选项。改动在 mod 源码中。若你需要 HDR 重
+            制，请改用上游 Luma 构建——但请注意它同样存在该 bug。
+          * 退出副本后若卡在加载界面，连按几次 ESC 退回主界面即可。回到主界面约一秒
+            后场景开始渲染，加载界面随之消失。停在副本结算界面时它不会自行消失——我
+            们等过 99 秒也未恢复。此期间游戏一直在满帧运行。
+          * 安装或更新后的首次启动会编译 mod 的着色器，比平时慢；之后不会。
+          * 若你同时使用 OptiScaler，不要让任一工具覆盖对方的代理文件。
+
+          署名与许可
+          ----------
+          本 mod 基于 Filippo Tarpini（Pumbo）的 Luma Framework 构建：
+          https://github.com/Filoppi/Luma-Framework
+          遵循其许可使用：允许再分发，但须署名作者；商业用途需事先征得作者同意。完整
+          许可文本见包内 LICENSE.md。所有渲染相关工作均由他完成，我们所做的仅为《尘
+          白禁区》的游戏预设、对应着色器挂载，以及本包的打包。
+
+          本 mod 为免费分享。如果你是花钱购买的，请尽快退款。
           '@
           Set-Content -Path (Join-Path $stage "README.txt") -Value $readme -Encoding utf8
 

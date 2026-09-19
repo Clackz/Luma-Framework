@@ -2052,7 +2052,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
          swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
          texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectAndIndirectDependencies;
+         // Kept at "None" (which is also its default) instead of the "DirectAndIndirectDependencies" the
+         // other Unreal Engine games use. With the indirect chain enabled, this game hangs on the MainMap
+         // loading screen when leaving a dungeon: it keeps running at full frame rate underneath, but the
+         // world only restarts rendering once the user presses ESC. Bisected 2026-09-19 by turning the
+         // individual HDR switches off one at a time - the swapchain upgrades, the texture format upgrades,
+         // the 2D size filters and the display composition setting are all still enabled here.
+         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::None;
 
 #if 0 // Not needed as it's done automatically now
       // TODO: automatically upgrade all textures that sample the tonemap LUT, and all textures in between tonemapping and the swapchain final write

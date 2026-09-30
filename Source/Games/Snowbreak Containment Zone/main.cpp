@@ -130,15 +130,9 @@ namespace
       bool enable_dithering_fix = false; // Master switch for dithering fix
       bool sr_auto_exposure = true;
 
-      // Luma HDR is intentionally unavailable for this game, because of a bug: with it enabled, leaving
-      // a dungeon and returning to the main lobby could leave the loading screen stuck indefinitely -
-      // the game itself stays alive and at full frame rate underneath, and pressing ESC back out to the
-      // "main" lobby screen clears it about a second later. Switching Luma HDR off removes the problem
-      // (measured 2026-09-17), so the option is not exposed here at all. Snowbreak also outputs SDR (its
-      // swapchain is DXGI_FORMAT_R10G10B10A2_UNORM), so the vanilla path is what this game wants anyway.
-      // Root cause is not isolated yet; it is somewhere in what the HDR path turns on (the swapchain /
-      // texture format upgrade chain). Want HDR? Build from upstream, the option still exists there.
-      bool enable_hdr = false; // See the note above: never true for this game
+      bool first_boot = true; // Automatic setting
+      bool enable_hdr = true;
+      bool next_enable_hdr = enable_hdr; // The value we serialize, that will be ignored until reboot
 
       CB::LumaGameSettings cb_default_game_settings;
    } // namespace
@@ -1715,9 +1709,66 @@ public:
 
    void DrawImGuiSettings(DeviceData& device_data) override
    {
-      // "Enable Luma HDR" and its sub-settings are intentionally not exposed for this game:
-      // Luma HDR is hard-disabled here (see the note where enable_hdr is defined).
+      auto& game_device_data = GetGameDeviceData(device_data);
+
+      reshade::api::effect_runtime* runtime = nullptr;
+
       ImGui::NewLine();
+
+      if (ImGui::Checkbox("Enable Luma HDR", &next_enable_hdr))
+      {
+         reshade::set_config_value(runtime, NAME, "EnableHDR", next_enable_hdr);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      {
+         ImGui::SetTooltip("Enables Luma's Unreal Engine HDR remastering. It works in the majority of games out of the box.\nIf the game already already supported HDR, make sure to turn it off in the settings.\n\nRequires rester to apply.");
+      }
+      // Print a check/warning if it's active or not active
+      if (enable_hdr || next_enable_hdr)
+      {
+         ImGui::SameLine();
+         ImGui::PushID("HDR Active");
+         ImGui::BeginDisabled();
+         ImGui::SmallButton(game_device_data.tonemap_lut_texture.get() ? ICON_FK_OK : ICON_FK_WARNING);
+         ImGui::EndDisabled();
+         ImGui::PopID();
+      }
+
+      if (enable_hdr && cb_luma_global_settings.DisplayMode == DisplayModeType::HDR)
+      {
+         if (GetShaderDefineCompiledNumericalValue(char_ptr_crc32("TONEMAP_TYPE")) == 2)
+         {
+            if (ImGui::SliderFloat("Highlights Hue Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation, 0.f, 1.f))
+            {
+               reshade::set_config_value(runtime, NAME, "HDRHighlightsHuePreservation", cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            {
+               ImGui::SetTooltip("The higher the value, the more we preserve the original (SDR) highlights hue (ELI5: color), which depending on the game, might often be distorted for HDR.");
+            }
+            DrawResetButton(cb_luma_global_settings.GameSettings.HDRHighlightsHuePreservation, cb_default_game_settings.HDRHighlightsHuePreservation, "HDRHighlightsHuePreservation", runtime);
+
+            if (ImGui::SliderFloat("Highlights Chrominance Preservation", &cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation, 0.f, 1.f))
+            {
+               reshade::set_config_value(runtime, NAME, "HDRHighlightsChrominancePreservation", cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            {
+               ImGui::SetTooltip("The higher the value, the more we preserve the original (SDR) highlights chrominance (ELI5: saturation), which depending on the game, might often be overly desaturated for HDR.");
+            }
+            DrawResetButton(cb_luma_global_settings.GameSettings.HDRHighlightsChrominancePreservation, cb_default_game_settings.HDRHighlightsChrominancePreservation, "HDRHighlightsChrominancePreservation", runtime);
+         }
+
+         if (ImGui::SliderFloat("Saturation", &cb_luma_global_settings.GameSettings.HDRChrominance, 0.f, 2.f))
+         {
+            reshade::set_config_value(runtime, NAME, "HDRChrominance", cb_luma_global_settings.GameSettings.HDRChrominance);
+         }
+         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+         {
+            ImGui::SetTooltip("Controls the global saturation/chrominance.");
+         }
+         DrawResetButton(cb_luma_global_settings.GameSettings.HDRChrominance, cb_default_game_settings.HDRChrominance, "HDRChrominance", runtime);
+      }
 
 #if ENABLE_SR
       ImGui::NewLine();
@@ -1967,9 +2018,26 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
    // Needs to be done after core init (because it calls some ReShade funcs)
    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
    {
-      // Luma HDR is hard-disabled for this game (see the note where enable_hdr is defined), so it is
-      // neither auto-detected from the primary display nor read from the user's config: an existing
-      // "EnableHDR" key is deliberately ignored. This means "FirstBoot" is no longer written here either.
+#if !DEVELOPMENT // Force HDR in dev mode, so we can easily debug textures
+      reshade::get_config_value(nullptr, NAME, "FirstBoot", first_boot);
+      if (first_boot)
+      {
+         reshade::set_config_value(nullptr, NAME, "FirstBoot", false);
+
+         // Automatically enable HDR in the mod if it's supported on the primary display on first boot
+         bool hdr_supported_display;
+         bool hdr_enabled_display;
+         Display::IsHDRSupportedAndEnabled(0, hdr_supported_display, hdr_enabled_display);
+         enable_hdr = hdr_supported_display;
+
+         reshade::set_config_value(nullptr, NAME, "EnableHDR", enable_hdr);
+      }
+      else
+      {
+         reshade::get_config_value(nullptr, NAME, "EnableHDR", enable_hdr);
+      }
+#endif
+      next_enable_hdr = enable_hdr;
       // Meant for games that already have good HDR, or to simply keep the original SDR output
       if (!enable_hdr)
       {
@@ -1984,7 +2052,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
          swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
          texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectAndIndirectDependencies;
+         // Kept at "None" (which is also its default) instead of the "DirectAndIndirectDependencies" the
+         // other Unreal Engine games use. With the indirect chain enabled, this game hangs on the MainMap
+         // loading screen when leaving a dungeon: it keeps running at full frame rate underneath, but the
+         // world only restarts rendering once the user presses ESC. Bisected 2026-09-19 by turning the
+         // individual HDR switches off one at a time - the swapchain upgrades, the texture format upgrades,
+         // the 2D size filters and the display composition setting are all still enabled here.
+         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::None;
 
 #if 0 // Not needed as it's done automatically now
       // TODO: automatically upgrade all textures that sample the tonemap LUT, and all textures in between tonemapping and the swapchain final write

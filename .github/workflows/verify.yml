@@ -1,0 +1,203 @@
+name: Verify
+
+# Fork-only workflow (`Clackz/Luma-Framework`).
+#
+# Upstream (`Filoppi/Luma-Framework`) has no unit/Integration test framework - there is no
+# `ctest`, no test project in `Luma.sln`, and `Scripts/` only holds the CI packaging helpers.
+# So "the tests" for this project are the two things that can actually be checked mechanically:
+#
+#   1. lint  - clang-format, over the files this push/PR touches (`Source/.clang-format`).
+#   2. build - MSVC compile of the Snowbreak Containment Zone addon + packaging.
+#
+# Everything runs on GitHub. Nothing needs to be run locally, and nothing here should be:
+# a local machine without MSVC/vcpkg cannot reproduce either job.
+#
+# How to read the results
+# -----------------------
+#   * Summary table  - open the run, the "Test report" job's summary shows pass/fail per job.
+#   * Failure logs   - the run's "Artifacts" section, `verify-report-<run id>`:
+#                        ci-report/msbuild-reshade.log
+#                        ci-report/msbuild-snowbreak.log   <- compile errors land here
+#                        ci-report/lint.log
+#                        ci-report/summary.md
+#                      The same log tail is echoed into the step output and the job summary.
+#   * Annotations    - cpp-linter posts clang-format findings as PR annotations (lint job).
+#
+# Triggered on every push to any branch and on any pull request, so a branch only needs to be
+# pushed to be verified. Runs are grouped per ref and superseded ones are cancelled.
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (clang-format)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same configuration the upstream `lint.yml` uses, so a finding here is a finding there.
+      - name: Run clang-format
+        id: linter
+        uses: cpp-linter/cpp-linter-action@main
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          style: file
+          files-changed-only: true
+          thread-comments: false
+          ignore: 'Source/External/** | **/safetyhook* | **/Zydis*'
+
+      - name: Write report
+        if: always()
+        run: |
+          mkdir -p ci-report
+          {
+            echo "# Verify - lint"
+            echo ""
+            echo "- event: ${{ github.event_name }}"
+            echo "- ref: ${{ github.ref }}"
+            echo "- sha: ${{ github.sha }}"
+            echo "- clang-format findings: ${{ steps.linter.outputs.checks-failed || 0 }}"
+          } > ci-report/lint.log
+          cat ci-report/lint.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-lint
+          path: ci-report
+          if-no-files-found: warn
+
+      # Note: no `continue-on-error` here - a formatting finding must fail the run.
+      - name: Fail if clang-format reported findings
+        if: steps.linter.outputs.checks-failed > 0
+        run: |
+          echo "::error::clang-format reported ${{ steps.linter.outputs.checks-failed }} finding(s)"
+          exit 1
+
+  build:
+    name: Build (MSVC)
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll as dxgi.dll
+      # for the x64 addon.
+      - name: Build ReShade.sln Release x64
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-report | Out-Null
+          msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145 "/flp:LogFile=ci-report\msbuild-reshade.log;Verbosity=minimal"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content ci-report\msbuild-reshade.log -Tail 80
+            exit 1
+          }
+
+      # Publishing-Release on purpose - it is the configuration Luma ships publicly.
+      # No `continue-on-error`: a compile error must fail the run loudly.
+      - name: Build Snowbreak Containment Zone addon (Publishing-Release x64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-report | Out-Null
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/flp:LogFile=ci-report\msbuild-snowbreak.log;Verbosity=minimal"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::solution-target build failed, retrying with a direct project build"
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma" "/flp:LogFile=ci-report\msbuild-snowbreak.log;Verbosity=minimal;Append"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Snowbreak Containment Zone failed to compile - see ci-report\msbuild-snowbreak.log"
+              Get-Content ci-report\msbuild-snowbreak.log -Tail 120
+              exit 1
+            }
+          }
+
+      - name: Package addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Publishing-Release" -Platform "x64" -OutDir "."
+
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
+            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
+            exit 1
+          }
+          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
+
+      - name: Upload packaged addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak-verify
+          path: Luma-Snowbreak_Containment_Zone.zip
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-build
+          path: ci-report
+          if-no-files-found: warn
+
+  report:
+    name: Test report
+    needs: [ lint, build ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose summary
+        run: |
+          mkdir -p ci-report
+          {
+            echo "# Verify results"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| lint (clang-format) | ${{ needs.lint.result }} |"
+            echo "| build (MSVC) | ${{ needs.build.result }} |"
+            echo ""
+            echo "- event: \`${{ github.event_name }}\`"
+            echo "- ref: \`${{ github.ref }}\`"
+            echo "- sha: \`${{ github.sha }}\`"
+            echo ""
+            echo "Logs: this run's **Artifacts** section (\`verify-report-lint\`, \`verify-report-build\`)."
+          } > ci-report/summary.md
+          cat ci-report/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-summary
+          path: ci-report
+          if-no-files-found: warn
+
+      - name: Fail if any check failed
+        if: needs.lint.result != 'success' || needs.build.result != 'success'
+        run: |
+          echo "::error::verify failed - lint=${{ needs.lint.result }} build=${{ needs.build.result }}"
+          exit 1

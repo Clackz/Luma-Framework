@@ -47,7 +47,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Same configuration the upstream `lint.yml` uses, so a finding here is a finding there.
+      # Same clang-format configuration the upstream `lint.yml` uses, with two deliberate
+      # differences (upstream's config predates both):
+      #
+      #   * `lines-changed-only: true` - upstream leaves this at its default (false), so any
+      #     push touching a file also re-reports that file's pre-existing findings. In
+      #     `Source/Games/Snowbreak Containment Zone/main.cpp` those are lines 90-94 (the
+      #     UE4-SRSTATE log call) and 1021 (a commented-out line), all of them upstream's
+      #     own code. Measured: identical findings with clang-format 21 (CI) and 23 (local).
+      #     Without this the check is red on code you never touched and can't act on.
+      #
+      #   * `tidy-checks: '-*'` - clang-tidy is disabled. It runs with an include path that
+      #     cannot resolve `..\..\Core\core.hpp` from this game's directory, so it fails with
+      #     "file not found" and then reports ~216 bogus findings for that one file. Not
+      #     signal, and it would drown the clang-format result.
+      #
+      # Net effect: clang-format, over the lines this push/PR actually changes.
       - name: Run clang-format
         id: linter
         uses: cpp-linter/cpp-linter-action@main
@@ -57,6 +72,8 @@ jobs:
         with:
           style: file
           files-changed-only: true
+          lines-changed-only: true
+          tidy-checks: '-*'
           thread-comments: false
           ignore: 'Source/External/** | **/safetyhook* | **/Zydis*'
 

@@ -23,8 +23,8 @@ on:
         description: 'Also build the Nexus-ready package (drops dxgi.dll / nvngx_dlss.dll, adds LICENSE + attribution)'
         type: boolean
         default: true
-      nexus_version:
-        description: 'Version string used to name the Nexus package'
+      version:
+        description: 'Release version. Names the git tag (v<version>), the release title and the Nexus package. Bump it for every published build - reusing one moves an existing tag.'
         type: string
         default: '1.0'
 
@@ -131,7 +131,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = "${{ inputs.nexus_version }}"
+          # A leading "v" is accepted so the same string can be pasted everywhere, but the
+          # archive name stays bare (Luma-Snowbreak-Nexus-1.1.zip, not ...-v1.1.zip).
+          $version = ("${{ inputs.version }}" -replace '^v', '')
           if ([string]::IsNullOrWhiteSpace($version)) { $version = "0.0" }
 
           $sourceZip = Get-ChildItem -Path dist -Filter *.zip -File | Sort-Object Name | Select-Object -First 1
@@ -457,19 +459,48 @@ jobs:
           fi
           ls -l dist/*Nexus*.zip
 
-      # The tag deliberately lives in its own `snowbreak-<n>` namespace instead of the
-      # upstream `latest-<n>` scheme: this repository still carries ~350 orphaned
-      # `latest-*` tags from earlier full-matrix runs, and reusing that namespace would
-      # make the run number collide with an existing tag - action-gh-release would then
-      # attach the new release to whatever commit that old tag points at.
+      # The tag is the release version (v1.1), not the Actions run number. A run number
+      # only says "the 30th time some workflow ran": it jumps for unrelated reasons and
+      # tells a user nothing about what changed.
+      #
+      # It also keeps its own `v<version>` namespace instead of the upstream `latest-<n>`
+      # scheme: this repository still carries ~350 orphaned `latest-*` tags from earlier
+      # full-matrix runs, and reusing that namespace would make the number collide with an
+      # existing tag - action-gh-release would then attach the new release to whatever
+      # commit that old tag points at.
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          v="${{ inputs.version }}"
+          v="${v#v}"
+          if [ -z "$v" ]; then
+            echo "::error::the version input is empty - pass an explicit version"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $v as tag v$v"
+
+      # Fail closed. softprops/action-gh-release will happily move an existing tag, which
+      # would silently repoint a version that users may already have downloaded.
+      - name: Refuse to move an existing tag
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::tag ${{ steps.ver.outputs.tag }} already exists - bump the version input instead of moving a published tag"
+            exit 1
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: snowbreak-${{ github.run_number }}
-          name: Release (Build ${{ github.run_number }})
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Release ${{ steps.ver.outputs.version }}
           body: |
             Luma for **Snowbreak: Containment Zone** - fork build, x64 addon only.
 
+            - Version: ${{ steps.ver.outputs.version }}
             - Built from commit ${{ github.sha }}
             - Configuration: `Publishing-Release` / `x64`
             - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files

@@ -14,7 +14,8 @@ name: Verify
 #
 # How to read the results
 # -----------------------
-#   * Summary table  - open the run, the "Test report" job's summary shows pass/fail per job.
+#   * Job results   - the run page shows `Lint (clang-format)` and `Build (MSVC)` directly.
+#                     Both fail loudly on their own; nothing aggregates them any more.
 #   * Failure logs   - the run's "Artifacts" section, `verify-report-<run id>`:
 #                        ci-report/msbuild-reshade.log
 #                        ci-report/msbuild-snowbreak.log   <- compile errors land here
@@ -23,12 +24,24 @@ name: Verify
 #                      The same log tail is echoed into the step output and the job summary.
 #   * Annotations    - cpp-linter posts clang-format findings as PR annotations (lint job).
 #
-# Triggered on every push to any branch and on any pull request, so a branch only needs to be
-# pushed to be verified. Runs are grouped per ref and superseded ones are cancelled.
+# Triggered on every push to any branch except `main`, and on any pull request, so a branch
+# only needs to be pushed to be verified. Runs are grouped per ref and superseded ones are
+# cancelled.
+#
+# Why `main` is excluded
+# ----------------------
+# On `main`, `Build UE Mod Only` already compiles Publishing-Release and packages it, and
+# `Build Snowbreak (Development)` compiles Development-Release. Running this workflow there
+# too compiled Publishing-Release a second time for no extra signal - the two jobs are the
+# same `msbuild` and the same `package.ps1`, producing the same archive under a different
+# artifact name. So `main` gets the two build workflows and this one covers everything else:
+# push a feature branch and it is built and linted, without waiting for a release pipeline.
+#
+# Use `workflow_dispatch` to run it against `main` anyway when that is what you want to check.
 
 on:
   push:
-    branches: [ '**' ]
+    branches-ignore: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -181,40 +194,3 @@ jobs:
           path: ci-report
           if-no-files-found: warn
 
-  report:
-    name: Test report
-    needs: [ lint, build ]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Compose summary
-        run: |
-          mkdir -p ci-report
-          {
-            echo "# Verify results"
-            echo ""
-            echo "| Check | Result |"
-            echo "|---|---|"
-            echo "| lint (clang-format) | ${{ needs.lint.result }} |"
-            echo "| build (MSVC) | ${{ needs.build.result }} |"
-            echo ""
-            echo "- event: \`${{ github.event_name }}\`"
-            echo "- ref: \`${{ github.ref }}\`"
-            echo "- sha: \`${{ github.sha }}\`"
-            echo ""
-            echo "Logs: this run's **Artifacts** section (\`verify-report-lint\`, \`verify-report-build\`)."
-          } > ci-report/summary.md
-          cat ci-report/summary.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: verify-report-summary
-          path: ci-report
-          if-no-files-found: warn
-
-      - name: Fail if any check failed
-        if: needs.lint.result != 'success' || needs.build.result != 'success'
-        run: |
-          echo "::error::verify failed - lint=${{ needs.lint.result }} build=${{ needs.build.result }}"
-          exit 1

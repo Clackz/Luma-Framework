@@ -1,0 +1,81 @@
+# Builds the DEVELOPMENT configuration of the Snowbreak addon: the same
+# MaxSpeed optimisation as Publishing-Release, but with DEVELOPMENT=1 defined.
+#
+# Why this exists: the shipping Publishing-Release build compiles out everything
+# behind #if DEVELOPMENT, including the draw-call tracer and the ImGui panels.
+# When a rendering bug reproduces only under specific settings, guessing from
+# ReShade.log is not enough - being able to dump the actual draw calls (RT
+# sizes, formats, cbuffer contents) is what turns a hypothesis into a fact.
+#
+# That is not hypothetical: the "displaced DLSS frame" bug was misdiagnosed
+# twice from logs alone. The diagnostic that settled it (the motion-vector
+# resolution the decode shader divides by, which has to equal the DLSS input
+# size) is now printed by UE4-SRSTATE, and this configuration is what one
+# reaches for when that is not enough.
+#
+# Development-Release also keeps NDEBUG, so the assert()s that pop a modal
+# message box mid-game stay compiled out - same reasoning as Publishing-Release.
+#
+# Not for distribution. The Development configuration also loads shaders from
+# <game>/Luma/<Project>/, the same as Publishing, so the shader mount is
+# unchanged.
+name: Build Snowbreak (Development)
+
+on:
+  push:
+    branches:
+      - 'snowbreak-sr-alignment-fix'
+  workflow_dispatch:
+
+jobs:
+  build-ue-dev:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      - name: Build Snowbreak Containment Zone addon (Development-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Package Snowbreak Containment Zone addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Development-Release" -Platform "x64" -OutDir "."
+
+      # CI red line: a job that consumes an artifact must assert it is there,
+      # otherwise a packaging failure silently ships an empty download.
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
+            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
+            exit 1
+          }
+          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak-Development
+          path: Luma-Snowbreak_Containment_Zone.zip
+          if-no-files-found: error

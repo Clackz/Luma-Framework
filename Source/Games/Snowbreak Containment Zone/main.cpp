@@ -74,7 +74,14 @@ namespace
    // the NGX feature. Dump the full tuple once per distinct combination, plus
    // the raw motion-vector size and whether it was accepted, so a rebuild that
    // these settings did NOT ask for can be told apart from one they did.
-   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used)
+   //
+   // mv_res_x/mv_res_y is the resolution the motion-vector decode shader
+   // divides by. It has to equal the DLSS input size: when it does not, every
+   // motion vector is scaled by (mv_res / in_w) and the temporal history
+   // smears along a wrong vector, which reads on screen as a displaced but
+   // still recognisable copy of the frame. Both are printed so that condition
+   // is visible in the log instead of having to be inferred.
+   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used, float mv_res_x, float mv_res_y)
    {
       static SR::SettingsData seen[32];
       static int seen_n = 0;
@@ -88,10 +95,11 @@ namespace
       if (seen_n < 32)
          seen[seen_n++] = s;
       reshade::log::message(reshade::log::level::warning, std::format(
-         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
+         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {} mvres {}x{}",
          seen_n, calls, sr_update_calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
          mv_used ? "used" : "stale", s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
-         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset).c_str());
+         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset,
+         (int)mv_res_x, (int)mv_res_y).c_str());
    }
 
    // The upscale pass is only a resolution change when input and output share
@@ -345,8 +353,18 @@ class UnrealEngine final : public Game // ### Rename this to your game's name ##
       context->PSSetShader(nullptr, nullptr, 0); // TODO: delete these? not needed
       context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("Decode MVs CS")].get(), nullptr, 0);
       context->CSSetUnorderedAccessViews(0, 1, &dlss_motion_vectors_uav_const, nullptr);
-      UINT width = static_cast<UINT>(game_device_data.render_resolution.x);
-      UINT height = static_cast<UINT>(game_device_data.render_resolution.y);
+      // Dispatch over the real size of the MV target. This used to come from
+      // game_device_data.render_resolution, which is only ever written in
+      // OnInitSwapchain and therefore holds a stale backbuffer size whenever
+      // the internal render resolution differs from it. Dispatching with that
+      // covers the wrong number of pixels: the right/bottom of the MV buffer
+      // keeps the previous frame's values, and those stale vectors get fed to
+      // DLSS. The capture size recorded alongside the MVs is what this texture
+      // actually is, so prefer it and fall back to the field otherwise.
+      const UINT width = game_device_data.capture_mv_w.load() > 0
+         ? game_device_data.capture_mv_w.load() : static_cast<UINT>(game_device_data.render_resolution.x);
+      const UINT height = game_device_data.capture_mv_h.load() > 0
+         ? game_device_data.capture_mv_h.load() : static_cast<UINT>(game_device_data.render_resolution.y);
       UINT groupsX = (width + 8 - 1) / 8;
       UINT groupsY = (height + 8 - 1) / 8;
       context->Dispatch(
@@ -841,7 +859,8 @@ public:
                            LogUpscaleSkip(upscale_input_desc.Width, upscale_input_desc.Height, upscale_output_desc.Width, upscale_output_desc.Height,
                               !capture_is_current ? "stale-capture" : "mv-size-mismatch");
                         }
-                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mvs_usable);
+                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mvs_usable,
+                           game_device_data.render_resolution.x, game_device_data.render_resolution.y);
                         // Hand OptiScaler a change only when one of the eleven
                         // compared fields actually moved. Re-sending an
                         // identical tuple is a no-op for it but the comparison
@@ -1636,8 +1655,9 @@ public:
                draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.depth_buffer.get();
                draw_data.pre_exposure = 0.0f; // automatic exposure
-               // Jitter offset must be in DLSS input pixels, not in the stale
-               // game_device_data.render_resolution (only set once at init).
+               // Jitter offset must be in DLSS input pixels. settings_data's
+               // render size is the real input texture, so use it rather than
+               // game_device_data.render_resolution.
                draw_data.jitter_x = game_device_data.jitter.x * settings_data.render_width * 0.5f;
                draw_data.jitter_y = game_device_data.jitter.y * settings_data.render_height * -0.5f;
                draw_data.reset = reset_sr;
@@ -1743,6 +1763,36 @@ public:
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+
+      // game_device_data.render_resolution used to be written exactly once, in
+      // OnInitSwapchain, and never again (the two writes in the TAA slot are
+      // commented out). It therefore kept whatever the backbuffer size happened
+      // to be when the swapchain was first created, for the rest of the session.
+      //
+      // That value is the basis of the motion-vector decode shader: it ends up
+      // in LumaData.GameData.RenderResolution, and the shader computes
+      //     screenSpaceDelta = motionDelta * renderRes.xy
+      // to convert a clip-space motion delta into screen pixels. When the
+      // internal render resolution is not the one this field was initialised
+      // to, every motion vector is scaled by the wrong factor, and DLSS
+      // reprojects the history with it. The temporal image then smears along
+      // the wrong vector - which is the reported "a recognisable copy of the
+      // character displaced to one side".
+      //
+      // device_data.render_resolution is the live value: the per-view global
+      // constant buffer scan refreshes it every frame with the real internal
+      // render resolution (it is what the upscale pass compares its input
+      // against), so mirror that here. The MVs are expressed in pixels of
+      // that same resolution, so this makes the two consistent by
+      // construction.
+      if (game_device_data.found_per_view_globals.load())
+      {
+         const float w = device_data.render_resolution.x;
+         const float h = device_data.render_resolution.y;
+         game_device_data.render_resolution = { w, h, w > 0.0f ? 1.0f / w : 0.0f, h > 0.0f ? 1.0f / h : 0.0f };
+         game_device_data.viewport_rect = { 0.0f, 0.0f, w, h };
+      }
+
       data.GameData.ViewportRect = game_device_data.viewport_rect;
       data.GameData.RenderResolution = game_device_data.render_resolution;
       data.GameData.ClipToPrevClip = game_device_data.clip_to_prev_clip_matrix;

@@ -64,18 +64,31 @@ jobs:
 
       # CI red line: a job that consumes an artifact must assert it is there,
       # otherwise a packaging failure silently ships an empty download.
+      #
+      # The archive name is configuration-dependent: package.ps1 appends -Dev
+      # for Development-Release, -Dev-Dbg for Development-Debug and -Test for
+      # Test-Release, so the Publishing-Release name does not exist here.
+      # Match on the suffix rather than on a hardcoded name.
       - name: Verify output exists
         shell: pwsh
         run: |
-          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
-            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
+          $zip = Get-ChildItem -Filter "Luma-Snowbreak_Containment_Zone*.zip" | Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "::error::No Luma-Snowbreak_Containment_Zone*.zip was produced!"
+            Get-ChildItem -Filter "*.zip" | Select-Object Name, Length
             exit 1
           }
-          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
+          if ($zip.Length -lt 1MB) {
+            Write-Host "::error::$($zip.Name) is only $($zip.Length) bytes - packaging produced nothing useful!"
+            exit 1
+          }
+          $zip | Select-Object Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Luma-Snowbreak-Development
-          path: Luma-Snowbreak_Containment_Zone.zip
+          # Glob, not the Publishing-Release name: package.ps1 suffixes this
+          # one with -Dev.
+          path: Luma-Snowbreak_Containment_Zone*.zip
           if-no-files-found: error

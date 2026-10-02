@@ -22,9 +22,12 @@
 name: Build Snowbreak (Development)
 
 on:
+  # Follows main, where the SR fix now lives. It was originally bound to the
+  # feature branch, which stopped making sense once that branch was merged and
+  # would have silently stopped producing diagnosis builds.
   push:
     branches:
-      - 'snowbreak-sr-alignment-fix'
+      - 'main'
   workflow_dispatch:
 
 jobs:

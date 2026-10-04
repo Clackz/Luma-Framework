@@ -124,6 +124,17 @@ namespace
       seen_n++;
       reshade::log::message(reshade::log::level::warning, std::format("UE4-SKIP: {} IN {}x{} OUT {}x{}", reason, in_w, in_h, out_w, out_h).c_str());
    }
+
+   // Logged once per reason: the SR slot was skipped because the selected type
+   // has no live implementation or no instance data.
+   static inline void LogSRSkip(const char* reason)
+   {
+      static std::string last_reason;
+      if (last_reason == reason)
+         return;
+      last_reason = reason;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-SRSKIP: {}", reason).c_str());
+   }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
    std::shared_mutex ssao_mutex;      // Added mutex for SSAO info
@@ -754,7 +765,11 @@ public:
                       upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
                   {
                      auto* sr_instance_data = device_data.GetSRInstanceData();
-                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type].get();
+                     SR::SuperResolutionImpl* sr_impl = nullptr;
+                     // find() instead of operator[]: the latter inserts a null
+                     // entry for a type that has no implementation (None is -1).
+                     if (const auto sr_impl_it = sr_implementations.find(device_data.sr_type); sr_impl_it != sr_implementations.end())
+                        sr_impl = sr_impl_it->second.get();
                      if (sr_instance_data && sr_impl)
                      {
                         SR::SettingsData settings_data;
@@ -1276,7 +1291,17 @@ public:
             if (game_device_data.found_per_view_globals.load() == false)
                return DrawOrDispatchOverrideType::None;
             auto* sr_instance_data = device_data.GetSRInstanceData();
-            ASSERT_ONCE(sr_instance_data);
+            // A runtime SR type switch only reassigns device_data.sr_type, so the
+            // new type may have no live instance yet (None has no impl at all).
+            // Dereferencing either unconditionally crashed the process.
+            SR::SuperResolutionImpl* sr_impl = nullptr;
+            if (const auto sr_impl_it = sr_implementations.find(device_data.sr_type); sr_impl_it != sr_implementations.end())
+               sr_impl = sr_impl_it->second.get();
+            if (sr_instance_data == nullptr || sr_impl == nullptr)
+            {
+               LogSRSkip(sr_instance_data == nullptr ? "no SR instance data for the selected type" : "no SR implementation for the selected type");
+               return DrawOrDispatchOverrideType::None;
+            }
 
             if (sr_hook_upscale)
             {
@@ -1416,7 +1441,7 @@ public:
             // kept in this form so it stays correct if they ever diverge.
             settings_data.mvs_x_scale = (float)settings_data.render_width / (float)taa_output_texture_desc.Width;
             settings_data.mvs_y_scale = (float)settings_data.render_height / (float)taa_output_texture_desc.Height;
-            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+            sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
             constexpr bool dlss_use_native_uav = true;
             bool dlss_output_supports_uav = dlss_use_native_uav && (taa_output_texture_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
@@ -1568,7 +1593,7 @@ public:
                draw_data.far_plane = FLT_MAX; // TODO: made up values
                draw_data.vert_fov = game_device_data.fov_y;
 
-               bool dlss_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
+               bool dlss_succeeded = sr_impl->Draw(sr_instance_data, native_device_context, draw_data);
                draw_state_stack.Restore(native_device_context);
                compute_state_stack.Restore(native_device_context);
                if (dlss_succeeded)

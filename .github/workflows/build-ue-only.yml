@@ -231,13 +231,10 @@ jobs:
 
           Notes
           -----
-          * Luma's HDR remastering is not exposed in this build, because of a bug.
-            With it enabled, leaving a stage and returning to the main lobby could
-            leave the loading screen stuck, even though the game itself kept running
-            at full frame rate underneath. Switching it off removes the problem, so
-            the option is simply not there. The change is in the mod's source. If you
-            want HDR remastering, use an upstream Luma build instead - it still has
-            this bug.
+          * Luma's HDR remastering is enabled on HDR displays by default. Untick
+            "Enable Luma HDR" in the Luma tab once if you want SDR output. Leaving a
+            stage and returning to the main lobby could once leave the loading screen
+            stuck while it was on; that is fixed from 1.1 onwards.
           * If you do get stuck on a loading screen after leaving a stage, press Esc a
             few times to back out to the main lobby screen. The world starts rendering
             about a second after the lobby screen is up, and the loading screen clears
@@ -299,10 +296,10 @@ jobs:
 
           注意事项
           --------
-          * 本版本未开放 Luma 的 HDR 重制，因为它存在 bug。开启时，退出副本回到主界面
-            可能一直卡在加载界面——游戏本身仍在满帧运行，但加载界面不消失。关闭后该
-            问题即消失，因此本版本不提供此选项。改动在 mod 源码中。若你需要 HDR 重
-            制，请改用上游 Luma 构建——但请注意它同样存在该 bug。
+          * Luma 的 HDR 重制在 HDR 显示器上默认开启。需要 SDR 输出的话，在 Luma
+            标签页里取消勾选 "Enable Luma HDR" 一次即可。开启时退出副本回到主界面
+            曾可能一直卡在加载界面——游戏本身仍在满帧运行，但加载界面不消失；该问题
+            自 1.1 起已修复。
           * 退出副本后若卡在加载界面，连按几次 ESC 退回主界面即可。回到主界面约一秒
             后场景开始渲染，加载界面随之消失。停在副本结算界面时它不会自行消失——我
             们等过 99 秒也未恢复。此期间游戏一直在满帧运行。

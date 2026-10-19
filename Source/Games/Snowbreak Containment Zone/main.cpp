@@ -1152,12 +1152,24 @@ public:
          // all, or whether only the viewport does, and whether TAA detection is running
          // before the cbuffer lookup has had a chance to succeed.
          {
-            static std::atomic<uint32_t> taa_size_diag_count{0};
-            if (taa_size_diag_count.fetch_add(1, std::memory_order_relaxed) < 8)
+            static std::array<uint32_t, 6> taa_size_diag_last = {};
+            static uint32_t taa_size_diag_count = 0;
+            D3D11_VIEWPORT taa_viewport = {};
+            UINT taa_viewport_count = 1;
+            native_device_context->RSGetViewports(&taa_viewport_count, &taa_viewport);
+            const std::array<uint32_t, 6> taa_size_diag_now = {
+               taa_pass_width,
+               taa_pass_height,
+               static_cast<uint32_t>(taa_viewport.Width),
+               static_cast<uint32_t>(taa_viewport.Height),
+               static_cast<uint32_t>(device_data.render_resolution.x),
+               static_cast<uint32_t>(device_data.render_resolution.y)};
+            // Log once per distinct size tuple, so a resolution or ScreenPercentage change
+            // shows up as a new line instead of being swallowed by a fixed line budget.
+            if (taa_size_diag_count < 24 && (taa_size_diag_count == 0 || taa_size_diag_now != taa_size_diag_last))
             {
-               D3D11_VIEWPORT taa_viewport = {};
-               UINT taa_viewport_count = 1;
-               native_device_context->RSGetViewports(&taa_viewport_count, &taa_viewport);
+               taa_size_diag_last = taa_size_diag_now;
+               taa_size_diag_count++;
                reshade::log::message(reshade::log::level::info,
                   std::format("UE4-DIAG: TAA pass 0x{:08X} cs={} desc={}x{} viewport={}x{} render_res={}x{} found_per_view_cb={}",
                      shader_hash, is_compute_shader, taa_pass_width, taa_pass_height,

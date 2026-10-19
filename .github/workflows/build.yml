@@ -1,22 +1,31 @@
-name: Build UE Mod Only
+name: Build Snowbreak
 
-# Fork-only workflow (`Clackz/Luma-Framework`).
+# The fork's single workflow (`Clackz/Luma-Framework`).
 #
-# Upstream still ships every game through `build_and_release.yml` (4 configurations
-# x 2 platforms, ~39 minutes). This fork only ever needs the single Snowbreak:
-# Containment Zone addon, so that matrix is disabled here and this workflow is the
-# only one that builds and publishes anything.
+# Upstream still ships every game through `build_and_release.yml` (4 configurations x 2
+# platforms, ~39 minutes). This fork only ever needs the single Snowbreak: Containment Zone
+# addon, so that matrix is gone and everything happens here. There used to be three separate
+# files - one building Publishing-Release on main, one building Development-Release on main,
+# and one linting+building feature branches - which between them compiled the same project
+# three ways from three copies of the same twelve steps. This file is those three merged:
 #
-# Push to `main` -> build only, the packaged zip stays an Actions artifact.
-# Manual run    -> build only; tick `release` to also create a GitHub Release.
+#   push to any branch   -> lint (non-main only) + Publishing-Release build + package
+#   push to main         -> the above, plus the Development-Release build
+#   manual dispatch      -> the above; tick `nexus` for the Nexus package, `release` to publish
 #
 # Before dispatching a release, walk through RELEASE.md. The text that ships to users -
 # Scripts/Nexus-README.txt inside the archive, and the description on the Nexus mod page -
 # is the part that goes stale silently, because nothing in the build fails when it lies.
 
 on:
+  # Every branch, main included: a feature branch is built and linted as soon as it is
+  # pushed, without waiting for a release pipeline, and main gets the same build.
+  #
+  # `pull_request` is deliberately not listed. Every branch this repository has is in this
+  # repository, so its push already reports the check on the PR; adding the trigger would
+  # only compile the same commit a second time.
   push:
-    branches: [ main ]
+    branches: [ '**' ]
   workflow_dispatch:
     inputs:
       release:
@@ -32,8 +41,88 @@ on:
         type: string
         default: '1.0'
 
+# A new push cancels the run it supersedes on the same branch, so a quick succession of
+# commits does not queue up builds of states nobody will ever download. A dispatch gets its
+# own group instead: a release must never be cancelled by somebody pushing while it runs.
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'push' }}
+  cancel-in-progress: true
+
 jobs:
-  build-ue-test:
+  # Not on main: that path is already covered by the build below, and a formatting finding
+  # there would be one in code a release is currently shipping. Feature branches get it so
+  # a style regression is caught before it lands.
+  lint:
+    name: Lint (clang-format)
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same tool the upstream `lint.yml` ran, with two deliberate differences (upstream's
+      # config predates both):
+      #
+      #   * `lines-changed-only: true` - upstream leaves this at its default (false), so any
+      #     push touching a file also re-reports that file's pre-existing findings. In
+      #     `Source/Games/Snowbreak Containment Zone/main.cpp` those are lines 90-94 (the
+      #     UE4-SRSTATE log call) and 1021 (a commented-out line), all of them upstream's
+      #     own code. Measured: identical findings with clang-format 21 (CI) and 23 (local).
+      #     Without this the check is red on code you never touched and can't act on.
+      #
+      #   * `tidy-checks: '-*'` - clang-tidy is disabled. It runs with an include path that
+      #     cannot resolve `..\..\Core\core.hpp` from this game's directory, so it fails with
+      #     "file not found" and then reports ~216 bogus findings for that one file. Not
+      #     signal, and it would drown the clang-format result.
+      #
+      # Net effect: clang-format, over the lines this push actually changes.
+      - name: Run clang-format
+        id: linter
+        uses: cpp-linter/cpp-linter-action@main
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          style: file
+          files-changed-only: true
+          lines-changed-only: true
+          tidy-checks: '-*'
+          thread-comments: false
+          ignore: 'Source/External/** | **/safetyhook* | **/Zydis*'
+
+      - name: Write report
+        if: always()
+        run: |
+          mkdir -p ci-report
+          {
+            echo "# Build - lint"
+            echo ""
+            echo "- event: ${{ github.event_name }}"
+            echo "- ref: ${{ github.ref }}"
+            echo "- sha: ${{ github.sha }}"
+            echo "- clang-format findings: ${{ steps.linter.outputs.checks-failed || 0 }}"
+          } > ci-report/lint.log
+          cat ci-report/lint.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: ci-report
+          if-no-files-found: warn
+
+      # Note: no `continue-on-error` here - a formatting finding must fail the run.
+      - name: Fail if clang-format reported findings
+        if: steps.linter.outputs.checks-failed > 0
+        run: |
+          echo "::error::clang-format reported ${{ steps.linter.outputs.checks-failed }} finding(s)"
+          exit 1
+
+  build:
+    name: Build (Publishing-Release)
     runs-on: windows-2025-vs2026
     steps:
       - name: Checkout code
@@ -49,14 +138,22 @@ jobs:
         shell: pwsh
         run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
 
-      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll
-      # as dxgi.dll for the x64 addon. The 32-bit build is skipped on purpose.
+      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll as dxgi.dll
+      # for the x64 addon. The 32-bit build is skipped on purpose. Logs go to ci-report so a
+      # failure is readable from the artifact instead of scrolling the job output.
       - name: Build ReShade.sln Release x64
-        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-report | Out-Null
+          msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145 "/flp:LogFile=ci-report\msbuild-reshade.log;Verbosity=minimal"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content ci-report\msbuild-reshade.log -Tail 80
+            exit 1
+          }
 
       # Build only the Snowbreak Containment Zone addon (main.cpp + Core unity_build.cpp are
-      # compiled in this project; there are no project references). No
-      # continue-on-error: a compile error must fail the run loudly.
+      # compiled in this project; there are no project references). No continue-on-error: a
+      # compile error must fail the run loudly.
       #
       # Publishing-Release on purpose - it is the configuration Luma ships publicly. It does
       # not define TEST/DEVELOPMENT, so the asserts that only exist in those configs are
@@ -65,16 +162,21 @@ jobs:
       # code, harmless, but it blocks the render thread while the box is open).
       # Our own UE4-UPSCALE / UE4-SRSTATE / UE4-SKIP diagnostics sit under #if ENABLE_SR and
       # are not affected by the configuration, so nothing is lost by dropping TEST.
-      # Note: like TEST, Publishing loads shaders from <game>/Luma/<Project>/, so the shader
+      # Note: this configuration loads shaders from <game>/Luma/<Project>/, so the shader
       # mount does not change.
       - name: Build Snowbreak Containment Zone addon (Publishing-Release x64)
         shell: pwsh
         run: |
-          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          New-Item -ItemType Directory -Force -Path ci-report | Out-Null
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/flp:LogFile=ci-report\msbuild-snowbreak.log;Verbosity=minimal"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
-            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
-            if ($LASTEXITCODE -ne 0) { exit 1 }
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma" "/flp:LogFile=ci-report\msbuild-snowbreak.log;Verbosity=minimal;Append"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Snowbreak Containment Zone failed to compile - see ci-report\msbuild-snowbreak.log"
+              Get-Content ci-report\msbuild-snowbreak.log -Tail 120
+              exit 1
+            }
           }
 
       - name: Package Snowbreak Containment Zone addon
@@ -82,6 +184,8 @@ jobs:
         run: |
           pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Publishing-Release" -Platform "x64" -OutDir "."
 
+      # CI red line: a job that consumes an artifact must assert it is there, otherwise a
+      # packaging failure silently ships an empty download.
       - name: Verify output exists
         shell: pwsh
         run: |
@@ -98,6 +202,92 @@ jobs:
           path: Luma-Snowbreak_Containment_Zone.zip
           if-no-files-found: error
 
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-report
+          path: ci-report
+          if-no-files-found: warn
+
+  # The same optimisation as Publishing-Release, but with DEVELOPMENT=1 defined.
+  #
+  # Why this exists: the shipping build compiles out everything behind #if DEVELOPMENT,
+  # including the draw-call tracer and the ImGui panels. When a rendering bug reproduces only
+  # under specific settings, guessing from ReShade.log is not enough - being able to dump the
+  # actual draw calls (RT sizes, formats, cbuffer contents) is what turns a hypothesis into a
+  # fact. That is not hypothetical: the "displaced DLSS frame" bug was misdiagnosed twice from
+  # logs alone.
+  #
+  # Development-Release also keeps NDEBUG, so the assert()s that pop a modal message box
+  # mid-game stay compiled out - same reasoning as Publishing-Release.
+  #
+  # Main only, like the release build it shadows: a feature branch is already compiled above,
+  # and compiling it a second time in another configuration buys nothing before it lands.
+  # Not for distribution.
+  build-dev:
+    name: Build (Development-Release)
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      - name: Build Snowbreak Containment Zone addon (Development-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Development-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Package Snowbreak Containment Zone addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Development-Release" -Platform "x64" -OutDir "."
+
+      # The archive name is configuration-dependent: package.ps1 appends -Dev for
+      # Development-Release, -Dev-Dbg for Development-Debug and -Test for Test-Release, so the
+      # Publishing-Release name does not exist here. Match on the suffix rather than on a
+      # hardcoded name.
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Filter "Luma-Snowbreak_Containment_Zone*.zip" | Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "::error::No Luma-Snowbreak_Containment_Zone*.zip was produced!"
+            Get-ChildItem -Filter "*.zip" | Select-Object Name, Length
+            exit 1
+          }
+          if ($zip.Length -lt 1MB) {
+            Write-Host "::error::$($zip.Name) is only $($zip.Length) bytes - packaging produced nothing useful!"
+            exit 1
+          }
+          $zip | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak-Development
+          # Glob, not the Publishing-Release name: package.ps1 suffixes this one with -Dev.
+          path: Luma-Snowbreak_Containment_Zone*.zip
+          if-no-files-found: error
+
   # Builds the archive we actually upload to Nexus, out of the one built above.
   #
   # The upstream packaging (Scripts/package.ps1) always drops its own ReShade build in as
@@ -110,7 +300,7 @@ jobs:
   # build came from, and fails closed if any file outside the allow-list survives.
   nexus-package:
     name: Build Nexus Package
-    needs: build-ue-test
+    needs: build
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.nexus == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -284,9 +474,9 @@ jobs:
 
   # Publishes the zip produced above as a GitHub Release.
   #
-  # Only runs on a manual dispatch with the "release" input left checked. A normal
-  # push to main never creates a release, so routine commits do not spawn a new
-  # version number every time.
+  # Only runs on a manual dispatch with the "release" input left checked. A normal push to
+  # main never creates a release, so routine commits do not spawn a new version number
+  # every time.
   #
   # `permissions: contents: write` is required: this repository defaults to read-only
   # workflow permissions, and no PAT secret is configured (the token input of
@@ -297,16 +487,16 @@ jobs:
     # NOTE: this job waits for BOTH upstream jobs. `nexus-package` is skipped unless the
     # "nexus" input is set, and a job whose `needs` was skipped is skipped too - so the
     # condition below has to defeat that with `always()`, guarded by an explicit check on
-    # build-ue-test's result so a failed build can never produce a release.
+    # the build's result so a failed build can never produce a release.
     #
-    # This was a real bug, found by running it: with `needs: build-ue-test` alone this job
-    # started before `nexus-package` had uploaded its artifact, the Nexus download failed
-    # with "Artifact not found", `continue-on-error` swallowed the error, and the release
-    # went out with one archive while its body promised two (run 35239084950, tag
-    # snowbreak-22). `always()` is required precisely because a skipped `needs` would
-    # otherwise skip this job too, which is the common `nexus=false` dispatch.
-    needs: [build-ue-test, nexus-package]
-    if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true' && needs.build-ue-test.result == 'success'
+    # This was a real bug, found by running it: with `needs: build` alone this job started
+    # before `nexus-package` had uploaded its artifact, the Nexus download failed with
+    # "Artifact not found", `continue-on-error` swallowed the error, and the release went out
+    # with one archive while its body promised two (run 35239084950, tag snowbreak-22).
+    # `always()` is required precisely because a skipped `needs` would otherwise skip this
+    # job too, which is the common `nexus=false` dispatch.
+    needs: [ build, nexus-package ]
+    if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -348,7 +538,7 @@ jobs:
       # tells a user nothing about what changed.
       #
       # It also keeps its own `v<version>` namespace instead of the upstream `latest-<n>`
-      # scheme: this repository still carries ~350 orphaned `latest-*` tags from earlier
+      # scheme: this repository still carries orphaned `latest-*` tags from earlier
       # full-matrix runs, and reusing that namespace would make the number collide with an
       # existing tag - action-gh-release would then attach the new release to whatever
       # commit that old tag points at.

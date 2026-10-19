@@ -74,7 +74,14 @@ namespace
    // the NGX feature. Dump the full tuple once per distinct combination, plus
    // the raw motion-vector size and whether it was accepted, so a rebuild that
    // these settings did NOT ask for can be told apart from one they did.
-   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used)
+   //
+   // mv_res_x/mv_res_y is the resolution the motion-vector decode shader
+   // divides by. It has to equal the DLSS input size: when it does not, every
+   // motion vector is scaled by (mv_res / in_w) and the temporal history
+   // smears along a wrong vector, which reads on screen as a displaced but
+   // still recognisable copy of the frame. Both are printed so that condition
+   // is visible in the log instead of having to be inferred.
+   static inline void LogSRState(const SR::SettingsData& s, uint32_t in_w, uint32_t in_h, uint32_t mv_w, uint32_t mv_h, bool mv_used, float mv_res_x, float mv_res_y)
    {
       static SR::SettingsData seen[32];
       static int seen_n = 0;
@@ -88,10 +95,11 @@ namespace
       if (seen_n < 32)
          seen[seen_n++] = s;
       reshade::log::message(reshade::log::level::warning, std::format(
-         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {}",
+         "UE4-SRSTATE#{} calls={} updates={}: in {}x{} out {}x{} mv {}x{} ({}) mvs {:.4f}/{:.4f} dyn {} hdr {} inv {} mvj {} ae {} preset {} mvres {}x{}",
          seen_n, calls, sr_update_calls, in_w, in_h, s.output_width, s.output_height, mv_w, mv_h,
          mv_used ? "used" : "stale", s.mvs_x_scale, s.mvs_y_scale, (int)s.dynamic_resolution, (int)s.hdr,
-         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset).c_str());
+         (int)s.inverted_depth, (int)s.mvs_jittered, (int)s.auto_exposure, s.render_preset,
+         (int)mv_res_x, (int)mv_res_y).c_str());
    }
 
    // The upscale pass is only a resolution change when input and output share
@@ -115,6 +123,17 @@ namespace
       seen_dim[seen_n][3] = out_h;
       seen_n++;
       reshade::log::message(reshade::log::level::warning, std::format("UE4-SKIP: {} IN {}x{} OUT {}x{}", reason, in_w, in_h, out_w, out_h).c_str());
+   }
+
+   // Logged once per reason: the SR slot was skipped because the selected type
+   // has no live implementation or no instance data.
+   static inline void LogSRSkip(const char* reason)
+   {
+      static std::string last_reason;
+      if (last_reason == reason)
+         return;
+      last_reason = reason;
+      reshade::log::message(reshade::log::level::warning, std::format("UE4-SRSKIP: {}", reason).c_str());
    }
    GlobalCBInfo global_cb_info;
    std::shared_mutex taa_mutex;
@@ -224,6 +243,15 @@ struct GameDeviceDataUnrealEngine final : public GameDeviceData
    std::unique_ptr<SR::SuperResolutionImpl::DrawData> sr_draw_data;
    std::atomic<bool> found_per_view_globals = false;
    std::atomic<bool> camera_cut = false;
+   // Real size of the decoded motion-vector target, recorded by the TAA slot.
+   // DecodeMotionVectors* dispatches over this instead of
+   // render_resolution, which is only written once in OnInitSwapchain and so
+   // holds the backbuffer size from whenever the swapchain was created -
+   // dispatching with that covered the wrong number of pixels whenever the
+   // internal render resolution differed, leaving the right/bottom of the MV
+   // buffer holding the previous frame's vectors.
+   std::atomic<uint32_t> capture_mv_w = 0;
+   std::atomic<uint32_t> capture_mv_h = 0;
 #endif // ENABLE_SR
    float4 render_resolution = {0.0f, 0.0f, 0.0f, 0.0f};
    float4 viewport_rect = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -315,8 +343,18 @@ class UnrealEngine final : public Game // ### Rename this to your game's name ##
       context->PSSetShader(nullptr, nullptr, 0); // TODO: delete these? not needed
       context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("Decode MVs CS")].get(), nullptr, 0);
       context->CSSetUnorderedAccessViews(0, 1, &dlss_motion_vectors_uav_const, nullptr);
-      UINT width = static_cast<UINT>(game_device_data.render_resolution.x);
-      UINT height = static_cast<UINT>(game_device_data.render_resolution.y);
+      // Dispatch over the real size of the MV target. This used to come from
+      // game_device_data.render_resolution, which is only ever written in
+      // OnInitSwapchain and therefore holds a stale backbuffer size whenever
+      // the internal render resolution differs from it. Dispatching with that
+      // covers the wrong number of pixels: the right/bottom of the MV buffer
+      // keeps the previous frame's values, and those stale vectors get fed to
+      // DLSS. The capture size recorded alongside the MVs is what this texture
+      // actually is, so prefer it and fall back to the field otherwise.
+      const UINT width = game_device_data.capture_mv_w.load() > 0
+         ? game_device_data.capture_mv_w.load() : static_cast<UINT>(game_device_data.render_resolution.x);
+      const UINT height = game_device_data.capture_mv_h.load() > 0
+         ? game_device_data.capture_mv_h.load() : static_cast<UINT>(game_device_data.render_resolution.y);
       UINT groupsX = (width + 8 - 1) / 8;
       UINT groupsY = (height + 8 - 1) / 8;
       context->Dispatch(
@@ -727,7 +765,11 @@ public:
                       upscale_input_desc.Width <= upscale_output_desc.Width && upscale_input_desc.Height <= upscale_output_desc.Height)
                   {
                      auto* sr_instance_data = device_data.GetSRInstanceData();
-                     SR::SuperResolutionImpl* sr_impl = sr_implementations[device_data.sr_type].get();
+                     SR::SuperResolutionImpl* sr_impl = nullptr;
+                     // find() instead of operator[]: the latter inserts a null
+                     // entry for a type that has no implementation (None is -1).
+                     if (const auto sr_impl_it = sr_implementations.find(device_data.sr_type); sr_impl_it != sr_implementations.end())
+                        sr_impl = sr_impl_it->second.get();
                      if (sr_instance_data && sr_impl)
                      {
                         SR::SettingsData settings_data;
@@ -780,7 +822,8 @@ public:
                         }
                         settings_data.mvs_x_scale = sr_mvs_x_scale;
                         settings_data.mvs_y_scale = sr_mvs_y_scale;
-                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mv_size_plausible);
+                        LogSRState(settings_data, upscale_input_desc.Width, upscale_input_desc.Height, mv_texture_desc.Width, mv_texture_desc.Height, mv_size_plausible,
+                           game_device_data.render_resolution.x, game_device_data.render_resolution.y);
                         // Hand OptiScaler a change only when one of the eleven
                         // compared fields actually moved. Re-sending an
                         // identical tuple is a no-op for it but the comparison
@@ -1248,7 +1291,17 @@ public:
             if (game_device_data.found_per_view_globals.load() == false)
                return DrawOrDispatchOverrideType::None;
             auto* sr_instance_data = device_data.GetSRInstanceData();
-            ASSERT_ONCE(sr_instance_data);
+            // A runtime SR type switch only reassigns device_data.sr_type, so the
+            // new type may have no live instance yet (None has no impl at all).
+            // Dereferencing either unconditionally crashed the process.
+            SR::SuperResolutionImpl* sr_impl = nullptr;
+            if (const auto sr_impl_it = sr_implementations.find(device_data.sr_type); sr_impl_it != sr_implementations.end())
+               sr_impl = sr_impl_it->second.get();
+            if (sr_instance_data == nullptr || sr_impl == nullptr)
+            {
+               LogSRSkip(sr_instance_data == nullptr ? "no SR instance data for the selected type" : "no SR implementation for the selected type");
+               return DrawOrDispatchOverrideType::None;
+            }
 
             if (sr_hook_upscale)
             {
@@ -1271,6 +1324,8 @@ public:
                         D3D11_TEXTURE2D_DESC object_velocity_texture_desc;
                         object_velocity_texture->GetDesc(&object_velocity_texture_desc);
                         object_velocity_texture_desc.Format = DXGI_FORMAT_R32G32_FLOAT; // Higher precision than the game's R16G16F, reduces shimmering on fine lines
+                        game_device_data.capture_mv_w = (uint32_t)object_velocity_texture_desc.Width;
+                        game_device_data.capture_mv_h = (uint32_t)object_velocity_texture_desc.Height;
                         if (is_compute_shader)
                         {
                            object_velocity_texture_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
@@ -1386,7 +1441,7 @@ public:
             // kept in this form so it stays correct if they ever diverge.
             settings_data.mvs_x_scale = (float)settings_data.render_width / (float)taa_output_texture_desc.Width;
             settings_data.mvs_y_scale = (float)settings_data.render_height / (float)taa_output_texture_desc.Height;
-            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context, settings_data);
+            sr_impl->UpdateSettings(sr_instance_data, native_device_context, settings_data);
 
             constexpr bool dlss_use_native_uav = true;
             bool dlss_output_supports_uav = dlss_use_native_uav && (taa_output_texture_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
@@ -1523,8 +1578,9 @@ public:
                draw_data.motion_vectors = game_device_data.sr_motion_vectors.get();
                draw_data.depth_buffer = game_device_data.depth_buffer.get();
                draw_data.pre_exposure = 0.0f; // automatic exposure
-               // Jitter offset must be in DLSS input pixels, not in the stale
-               // game_device_data.render_resolution (only set once at init).
+               // Jitter offset must be in DLSS input pixels. settings_data's
+               // render size is the real input texture, so use it rather than
+               // game_device_data.render_resolution.
                draw_data.jitter_x = game_device_data.jitter.x * settings_data.render_width * 0.5f;
                draw_data.jitter_y = game_device_data.jitter.y * settings_data.render_height * -0.5f;
                draw_data.reset = reset_sr;
@@ -1537,7 +1593,7 @@ public:
                draw_data.far_plane = FLT_MAX; // TODO: made up values
                draw_data.vert_fov = game_device_data.fov_y;
 
-               bool dlss_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context, draw_data);
+               bool dlss_succeeded = sr_impl->Draw(sr_instance_data, native_device_context, draw_data);
                draw_state_stack.Restore(native_device_context);
                compute_state_stack.Restore(native_device_context);
                if (dlss_succeeded)
@@ -1626,6 +1682,36 @@ public:
    void UpdateLumaInstanceDataCB(CB::LumaInstanceDataPadded& data, CommandListData& cmd_list_data, DeviceData& device_data) override
    {
       auto& game_device_data = GetGameDeviceData(device_data);
+
+      // game_device_data.render_resolution used to be written exactly once, in
+      // OnInitSwapchain, and never again (the two writes in the TAA slot are
+      // commented out). It therefore kept whatever the backbuffer size happened
+      // to be when the swapchain was first created, for the rest of the session.
+      //
+      // That value is the basis of the motion-vector decode shader: it ends up
+      // in LumaData.GameData.RenderResolution, and the shader computes
+      //     screenSpaceDelta = motionDelta * renderRes.xy
+      // to convert a clip-space motion delta into screen pixels. When the
+      // internal render resolution is not the one this field was initialised
+      // to, every motion vector is scaled by the wrong factor, and DLSS
+      // reprojects the history with it. The temporal image then smears along
+      // the wrong vector - which is the reported "a recognisable copy of the
+      // character displaced to one side".
+      //
+      // device_data.render_resolution is the live value: the per-view global
+      // constant buffer scan refreshes it every frame with the real internal
+      // render resolution (it is what the upscale pass compares its input
+      // against), so mirror that here. The MVs are expressed in pixels of
+      // that same resolution, so this makes the two consistent by
+      // construction.
+      if (game_device_data.found_per_view_globals.load())
+      {
+         const float w = device_data.render_resolution.x;
+         const float h = device_data.render_resolution.y;
+         game_device_data.render_resolution = { w, h, w > 0.0f ? 1.0f / w : 0.0f, h > 0.0f ? 1.0f / h : 0.0f };
+         game_device_data.viewport_rect = { 0.0f, 0.0f, w, h };
+      }
+
       data.GameData.ViewportRect = game_device_data.viewport_rect;
       data.GameData.RenderResolution = game_device_data.render_resolution;
       data.GameData.ClipToPrevClip = game_device_data.clip_to_prev_clip_matrix;
@@ -2052,7 +2138,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
          swapchain_format_upgrade_type = TextureFormatUpgradesType::AllowedEnabled;
          swapchain_upgrade_type = SwapchainUpgradeType::scRGB;
          texture_format_upgrades_type = TextureFormatUpgradesType::AllowedEnabled;
-         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::DirectAndIndirectDependencies;
+         // Kept at "None" (which is also its default) instead of the "DirectAndIndirectDependencies" the
+         // other Unreal Engine games use. With the indirect chain enabled, this game hangs on the MainMap
+         // loading screen when leaving a dungeon: it keeps running at full frame rate underneath, but the
+         // world only restarts rendering once the user presses ESC. Bisected 2026-09-19 by turning the
+         // individual HDR switches off one at a time - the swapchain upgrades, the texture format upgrades,
+         // the 2D size filters and the display composition setting are all still enabled here.
+         enable_chain_indirect_texture_format_upgrades = ChainTextureFormatUpgradesType::None;
 
 #if 0 // Not needed as it's done automatically now
       // TODO: automatically upgrade all textures that sample the tonemap LUT, and all textures in between tonemapping and the swapchain final write

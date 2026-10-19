@@ -8,7 +8,7 @@ name: Build UE Mod Only
 # only one that builds and publishes anything.
 #
 # Push to `main` -> build only, the packaged zip stays an Actions artifact.
-# Manual run    -> build, then create a GitHub Release carrying the zip.
+# Manual run    -> build only; tick `release` to also create a GitHub Release.
 #
 # Before dispatching a release, walk through RELEASE.md. The text that ships to users -
 # Scripts/Nexus-README.txt inside the archive, and the description on the Nexus mod page -
@@ -20,9 +20,9 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'Publish a GitHub Release with the packaged addon (uncheck to only produce the Actions artifact)'
+        description: 'Publish a GitHub Release with the packaged addon. Off by default: a plain dispatch then only produces the Actions artifact, and nothing is tagged or published.'
         type: boolean
-        default: true
+        default: false
       nexus:
         description: 'Also build the Nexus-ready package (drops dxgi.dll / nvngx_dlss.dll, adds LICENSE + attribution)'
         type: boolean

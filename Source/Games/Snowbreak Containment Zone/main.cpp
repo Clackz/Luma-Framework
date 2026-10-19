@@ -1145,6 +1145,28 @@ public:
                }
             }
          }
+         // DIAGNOSTIC (temporary, must not reach upstream or a release): print all three
+         // candidate sources for the TAA pass size in one line, plus whether the per-view
+         // global cbuffer has been located by this point. This is what decides the review
+         // question of whether texture descriptions track the internal render resolution at
+         // all, or whether only the viewport does, and whether TAA detection is running
+         // before the cbuffer lookup has had a chance to succeed.
+         {
+            static std::atomic<uint32_t> taa_size_diag_count{0};
+            if (taa_size_diag_count.fetch_add(1, std::memory_order_relaxed) < 8)
+            {
+               D3D11_VIEWPORT taa_viewport = {};
+               UINT taa_viewport_count = 1;
+               native_device_context->RSGetViewports(&taa_viewport_count, &taa_viewport);
+               reshade::log::message(reshade::log::level::info,
+                  std::format("UE4-DIAG: TAA pass 0x{:08X} cs={} desc={}x{} viewport={}x{} render_res={}x{} found_per_view_cb={}",
+                     shader_hash, is_compute_shader, taa_pass_width, taa_pass_height,
+                     static_cast<uint32_t>(taa_viewport.Width), static_cast<uint32_t>(taa_viewport.Height),
+                     static_cast<uint32_t>(device_data.render_resolution.x), static_cast<uint32_t>(device_data.render_resolution.y),
+                     game_device_data.found_per_view_globals.load())
+                     .c_str());
+            }
+         }
          size_t color_texture_count = 0;
          size_t depth_texture_count = 0;
          size_t velocity_texture_count = 0;

@@ -508,12 +508,24 @@ static bool IsUE4TAACandidate(const std::byte* code, size_t size, uint64_t shade
    // gather emitted by UE 4.26 (it walks the ICB offset table to accumulate the
    // YCoCg-clamped history neighbourhood) compiles down to a real loop/endloop pair.
    // Only an unbalanced pair indicates the bytecode scan itself went off the rails.
+   const float confidence = GetTAAShaderConfidence(code, size);
+   // DIAGNOSTIC (temporary, must not reach upstream or a release): measures what the loop
+   // guard actually does on a live game. "strict_reject" is the result of the pre-#206 rule,
+   // which rejected any shader holding a *balanced* loop/endloop pair. Every shader that gets
+   // this far is a TAA candidate that passed the resource-declaration and velocity checks, so
+   // counting these lines tells us both whether the real TAA shader has a loop at all, and how
+   // many other shaders the strict rule used to filter out.
+   reshade::log::message(reshade::log::level::info,
+      std::format("UE4-DIAG: TAA screen 0x{:08X} loop={} endloop={} conf={:.2f}% strict_reject={}",
+         shader_hash, loop_hits.size(), endloop_hits.size(), confidence,
+         !loop_hits.empty() && loop_hits.size() == endloop_hits.size())
+         .c_str());
+
    if (loop_hits.size() != endloop_hits.size())
    {
       return false;
    }
 
-   float confidence = GetTAAShaderConfidence(code, size);
    if (confidence < 60.0f)
    {
       reshade::log::message(reshade::log::level::info, std::format("UE4 TAA Shader detection for shader {:#08X} failed with confidence: {:.2f}%", shader_hash, confidence).c_str());

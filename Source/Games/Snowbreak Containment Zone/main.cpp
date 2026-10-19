@@ -678,7 +678,10 @@ public:
          return nullptr;
 
       TAAShaderInfo taa_shader_info = {};
-      bool is_taa_candidate = IsUE4TAACandidate(code, size, shader_hash, taa_shader_info) && FindShaderInfo(code, size, taa_shader_info);
+      // This game keeps the neighbourhood loop in its TAA pixel shader instead of emitting the
+      // unrolled form, so opt in to accepting a matched loop/endloop pair. Observed on the real
+      // shader (0xFE3356AA, confidence 130%); the only other candidate sits at 0%.
+      bool is_taa_candidate = IsUE4TAACandidate(code, size, shader_hash, taa_shader_info, true) && FindShaderInfo(code, size, taa_shader_info);
       if (is_taa_candidate)
       {
          reshade::log::message(reshade::log::level::info, std::format("UE4: Detected UE4 TAA shader Candidate. Hash: 0x{:08X}", shader_hash).c_str());

@@ -321,7 +321,7 @@ static bool IsUE4SSAOCandidate(const std::byte* code, size_t size, SSAOShaderInf
    return false;
 }
 
-static bool IsUE4TAACandidate(const std::byte* code, size_t size, uint64_t shader_hash, TAAShaderInfo& taa_shader_info)
+static bool IsUE4TAACandidate(const std::byte* code, size_t size, uint64_t shader_hash, TAAShaderInfo& taa_shader_info, bool accept_looped_shader = false)
 {
    // detects if the shader is a UE4 TAA Pixel Shader
    // first we should check resource declarations for textures:
@@ -504,11 +504,23 @@ static bool IsUE4TAACandidate(const std::byte* code, size_t size, uint64_t shade
       std::byte{endloop_opcode.b[3]},
    };
    std::vector<std::byte*> endloop_hits = System::ScanMemoryForPattern(code, size, endloop_pattern);
-   // A UE4 TAA pixel shader can legitimately contain a loop: the 9-tap neighborhood
-   // gather emitted by UE 4.26 (it walks the ICB offset table to accumulate the
-   // YCoCg-clamped history neighbourhood) compiles down to a real loop/endloop pair.
-   // Only an unbalanced pair indicates the bytecode scan itself went off the rails.
-   if (loop_hits.size() != endloop_hits.size())
+   // UE4's TAA pixel shader is normally emitted with its neighbourhood loop fully unrolled,
+   // so a loop/endloop pair is a hint that this is some other shader. That is what the
+   // original check encoded: a matched pair rejected the shader outright.
+   //
+   // Not every title unrolls it. Where the compiler keeps the loop the shader would be
+   // rejected although it is a genuine TAA pass, so such games can opt in through
+   // "accept_looped_shader": a matched pair is then let through to the confidence check
+   // below, while an unbalanced one (a scan artefact, or truncated bytecode) is still
+   // rejected. The default keeps the historical rule, so no game changes behaviour unless
+   // it explicitly asks for this.
+   const bool has_matched_loop = !loop_hits.empty() && loop_hits.size() == endloop_hits.size();
+   if (accept_looped_shader)
+   {
+      if (loop_hits.size() != endloop_hits.size())
+         return false;
+   }
+   else if (has_matched_loop)
    {
       return false;
    }

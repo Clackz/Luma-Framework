@@ -1,0 +1,407 @@
+name: Build UE Mod Only
+
+# Fork-only workflow (`Clackz/Luma-Framework`).
+#
+# Upstream still ships every game through `build_and_release.yml` (4 configurations
+# x 2 platforms, ~39 minutes). This fork only ever needs the single Snowbreak:
+# Containment Zone addon, so that matrix is disabled here and this workflow is the
+# only one that builds and publishes anything.
+#
+# Push to `main` -> build only, the packaged zip stays an Actions artifact.
+# Manual run    -> build only; tick `release` to also create a GitHub Release.
+#
+# Before dispatching a release, walk through RELEASE.md. The text that ships to users -
+# Scripts/Nexus-README.txt inside the archive, and the description on the Nexus mod page -
+# is the part that goes stale silently, because nothing in the build fails when it lies.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub Release with the packaged addon. Off by default: a plain dispatch then only produces the Actions artifact, and nothing is tagged or published.'
+        type: boolean
+        default: false
+      nexus:
+        description: 'Also build the Nexus-ready package (drops dxgi.dll / nvngx_dlss.dll, adds LICENSE + attribution)'
+        type: boolean
+        default: true
+      version:
+        description: 'Release version. Names the git tag (v<version>), the release title and the Nexus package. Bump it for every published build - reusing one moves an existing tag. Walk through RELEASE.md before dispatching: the archive README and the Nexus mod page description have to match this build.'
+        type: string
+        default: '1.0'
+
+jobs:
+  build-ue-test:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Integrate vcpkg with MSBuild
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install'
+
+      # Only the 64-bit ReShade build is needed: package.ps1 copies ReShade64.dll
+      # as dxgi.dll for the x64 addon. The 32-bit build is skipped on purpose.
+      - name: Build ReShade.sln Release x64
+        run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit" /p:PlatformToolset=v145
+
+      # Build only the Snowbreak Containment Zone addon (main.cpp + Core unity_build.cpp are
+      # compiled in this project; there are no project references). No
+      # continue-on-error: a compile error must fail the run loudly.
+      #
+      # Publishing-Release on purpose - it is the configuration Luma ships publicly. It does
+      # not define TEST/DEVELOPMENT, so the asserts that only exist in those configs are
+      # compiled out and can no longer pop a modal "Assertion failed" message box mid-game
+      # (e.g. the AreFormatsCopyCompatible one in core.hpp's MSAA resolve path - upstream
+      # code, harmless, but it blocks the render thread while the box is open).
+      # Our own UE4-UPSCALE / UE4-SRSTATE / UE4-SKIP diagnostics sit under #if ENABLE_SR and
+      # are not affected by the configuration, so nothing is lost by dropping TEST.
+      # Note: like TEST, Publishing loads shaders from <game>/Luma/<Project>/, so the shader
+      # mount does not change.
+      - name: Build Snowbreak Containment Zone addon (Publishing-Release x64)
+        shell: pwsh
+        run: |
+          msbuild Luma.sln /t:"Snowbreak Containment Zone" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Solution-target build failed, retrying with a direct project build..."
+            msbuild "Source\Games\Snowbreak Containment Zone\Snowbreak Containment Zone.vcxproj" /p:Configuration="Publishing-Release" /p:Platform="x64" /p:DefineConstants="REMOTE_BUILD=1" "/p:SolutionDir=$($PWD.Path.Replace('\','/'))/" "/p:SolutionName=Luma"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Package Snowbreak Containment Zone addon
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File "Scripts/package.ps1" -Project "Snowbreak Containment Zone" -Config "Publishing-Release" -Platform "x64" -OutDir "."
+
+      - name: Verify output exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "Luma-Snowbreak_Containment_Zone.zip")) {
+            Write-Host "::error::Luma-Snowbreak_Containment_Zone.zip was not produced!"
+            exit 1
+          }
+          Get-Item "Luma-Snowbreak_Containment_Zone.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: Luma-Snowbreak_Containment_Zone.zip
+          if-no-files-found: error
+
+  # Builds the archive we actually upload to Nexus, out of the one built above.
+  #
+  # The upstream packaging (Scripts/package.ps1) always drops its own ReShade build in as
+  # dxgi.dll, plus the NGX DLSS runtime when the project opts into UseLumaNGX. Neither
+  # belongs in a Nexus upload: dxgi.dll would take the proxy slot the user's own loader or
+  # OptiScaler already holds (silently overwriting a working ReShade install), and the
+  # ~58 MB NVIDIA runtime is something the user already has a newer copy of beside the game
+  # executable. So this job does not rebuild anything - it filters that archive, adds the
+  # licence and attribution the Luma licence requires for redistribution, records where the
+  # build came from, and fails closed if any file outside the allow-list survives.
+  nexus-package:
+    name: Build Nexus Package
+    needs: build-ue-test
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.nexus == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Only the licence text and the README that ships inside the archive come from the
+      # repository; the mod itself comes from the artifact built above.
+      - name: Checkout packaging files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            LICENSE.md
+            Scripts/Nexus-README.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: dist
+
+      - name: Filter and repack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # A leading "v" is accepted so the same string can be pasted everywhere, but the
+          # archive name stays bare (Luma-Snowbreak-Nexus-1.1.zip, not ...-v1.1.zip).
+          $version = ("${{ inputs.version }}" -replace '^v', '')
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "0.0" }
+
+          $sourceZip = Get-ChildItem -Path dist -Filter *.zip -File | Sort-Object Name | Select-Object -First 1
+          if (-not $sourceZip) {
+            Write-Host "::error::no packaged zip found under dist/"
+            exit 1
+          }
+          Write-Host "Source archive: $($sourceZip.Name) ($($sourceZip.Length) bytes)"
+
+          $stage = Join-Path $PWD "nexus-stage"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Expand-Archive -LiteralPath $sourceZip.FullName -DestinationPath $stage -Force
+
+          # 1. Drop what must never be redistributed.
+          $banned = @(
+            "dxgi.dll", "d3d11.dll", "d3d12.dll", "winmm.dll", "version.dll", "dinput8.dll",
+            "nvngx_dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssg.dll", "nvngx.dll"
+          )
+          $dropped = @()
+          foreach ($name in $banned) {
+            Get-ChildItem -Path $stage -Recurse -File -Filter $name | ForEach-Object {
+              $dropped += $_.FullName.Substring($stage.Length).TrimStart('\', '/')
+              Remove-Item -LiteralPath $_.FullName -Force
+            }
+          }
+          if ($dropped.Count -eq 0) {
+            Write-Host "::warning::nothing was dropped - did upstream stop shipping dxgi.dll / nvngx_dlss.dll?"
+          } else {
+            $dropped | ForEach-Object { Write-Host "  dropped: $_" }
+          }
+
+          # 2. What is left still has to be a working mod.
+          $addon = @(Get-ChildItem -Path $stage -Filter *.addon -File)
+          if ($addon.Count -ne 1) {
+            Write-Host "::error::expected exactly one .addon at the archive root, found $($addon.Count)"
+            exit 1
+          }
+          foreach ($mount in @("Luma/Global", "Luma/Includes", "Luma/Snowbreak Containment Zone")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $mount))) {
+              Write-Host "::error::missing shader mount: $mount"
+              exit 1
+            }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $stage "Luma/d3dcompiler_47.dll"))) {
+            Write-Host "::error::Luma/d3dcompiler_47.dll is missing - the mod cannot compile its shaders without it"
+            exit 1
+          }
+
+          # 3. Licence and attribution travel with the archive. The Luma licence allows
+          #    redistribution with attribution and asks to be contacted first for commercial
+          #    use, so shipping the licence text and the credit is not optional.
+          Copy-Item -LiteralPath "LICENSE.md" -Destination (Join-Path $stage "LICENSE.md") -Force
+
+          # Shipped as README.txt inside the archive. It is user-facing text that has
+          # to be re-read before every release, so it lives in its own file rather than
+          # in a here-string nobody opens. See RELEASE.md.
+          $readme = (Get-Content -LiteralPath "Scripts/Nexus-README.txt" -Raw) -replace "`r`n", "`n"
+          if ([string]::IsNullOrWhiteSpace($readme)) {
+            Write-Host "::error::Scripts/Nexus-README.txt is empty or missing"
+            exit 1
+          }
+          Write-Host "--- Nexus README shipped in this archive ---"
+          Write-Host $readme
+          Write-Host "--- end Nexus README ---"
+          Set-Content -Path (Join-Path $stage "README.txt") -Value $readme -Encoding utf8
+
+          # 4. Provenance, so a build can always be traced back to a commit.
+          function Get-PeTimeStamp([string]$Path) {
+            try {
+              $fs = [System.IO.File]::OpenRead($Path)
+              try {
+                $br = New-Object System.IO.BinaryReader($fs)
+                $fs.Position = 0x3C
+                $peOffset = $br.ReadInt32()
+                $fs.Position = $peOffset + 8
+                $seconds = $br.ReadUInt32()
+                return ([DateTimeOffset]::FromUnixTimeSeconds($seconds)).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+              } finally { $fs.Dispose() }
+            } catch { return "unavailable" }
+          }
+
+          $peTs = Get-PeTimeStamp -Path $addon[0].FullName
+          $addonHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $addon[0].FullName).Hash.ToLowerInvariant()
+          $buildInfo = @(
+            "Luma for Snowbreak: Containment Zone - Nexus package",
+            "version:       $version",
+            "commit:        ${{ github.sha }}",
+            "ref:           ${{ github.ref_name }}",
+            "workflow run:  ${{ github.run_id }} (build ${{ github.run_number }})",
+            "configuration: Publishing-Release / x64 (not TEST, not DEVELOPMENT)",
+            "addon:         $($addon[0].Name)",
+            "addon size:    $($addon[0].Length) bytes",
+            "addon sha256:  $addonHash",
+            "addon PE TimeDateStamp: $peTs",
+            "generated:     $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          ) -join "`n"
+          Set-Content -Path (Join-Path $stage "build-info.txt") -Value $buildInfo -Encoding utf8
+
+          # 5. Checksums, written after everything else so the file cannot end up listing itself.
+          $sums = Get-ChildItem -Path $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = $_.FullName.Substring($stage.Length).TrimStart('\', '/') -replace '\\', '/'
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $rel"
+          }
+          Set-Content -Path (Join-Path $stage "SHA256SUMS.txt") -Value $sums -Encoding utf8
+
+          # 6. Fail closed. A file outside the allow-list means upstream changed the package
+          #    layout: stop and look at it rather than publish something nobody inspected.
+          $allowedExt = @(".addon", ".hlsl", ".hlsli", ".h", ".yml", ".txt", ".md")
+          $allowedDll = @("d3dcompiler_47.dll")
+          $unexpected = @()
+          foreach ($f in Get-ChildItem -Path $stage -Recurse -File) {
+            $rel = $f.FullName.Substring($stage.Length).TrimStart('\', '/') -replace '\\', '/'
+            $ok = $allowedExt -contains $f.Extension.ToLowerInvariant()
+            if (-not $ok -and $f.Extension -ieq ".dll") {
+              $ok = ($allowedDll -contains $f.Name) -and $rel.StartsWith("Luma/")
+            }
+            if (-not $ok) { $unexpected += $rel }
+          }
+          if ($unexpected.Count -gt 0) {
+            $unexpected | ForEach-Object { Write-Host "::error::unexpected file in package: $_" }
+            exit 1
+          }
+
+          Write-Host "Final contents:"
+          Get-ChildItem -Path $stage -Recurse -File | ForEach-Object {
+            Write-Host "  $($_.FullName.Substring($stage.Length).TrimStart('\', '/'))"
+          }
+
+          # 7. Zip.
+          $out = Join-Path $PWD "Luma-Snowbreak-Nexus-$version.zip"
+          Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $out -Force
+          $zip = Get-Item -LiteralPath $out
+          Write-Host "Nexus package: $($zip.Name) / $($zip.Length) bytes"
+          Write-Host "sha256: $((Get-FileHash -Algorithm SHA256 -LiteralPath $out).Hash.ToLowerInvariant())"
+
+      - name: Upload Nexus package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Snowbreak-Nexus
+          path: Luma-Snowbreak-Nexus-*.zip
+          if-no-files-found: error
+
+  # Publishes the zip produced above as a GitHub Release.
+  #
+  # Only runs on a manual dispatch with the "release" input left checked. A normal
+  # push to main never creates a release, so routine commits do not spawn a new
+  # version number every time.
+  #
+  # `permissions: contents: write` is required: this repository defaults to read-only
+  # workflow permissions, and no PAT secret is configured (the token input of
+  # action-gh-release falls back to the automatic github.token, which only gains
+  # write access through this block).
+  release:
+    name: Publish Release
+    # NOTE: this job waits for BOTH upstream jobs. `nexus-package` is skipped unless the
+    # "nexus" input is set, and a job whose `needs` was skipped is skipped too - so the
+    # condition below has to defeat that with `always()`, guarded by an explicit check on
+    # build-ue-test's result so a failed build can never produce a release.
+    #
+    # This was a real bug, found by running it: with `needs: build-ue-test` alone this job
+    # started before `nexus-package` had uploaded its artifact, the Nexus download failed
+    # with "Artifact not found", `continue-on-error` swallowed the error, and the release
+    # went out with one archive while its body promised two (run 35239084950, tag
+    # snowbreak-22). `always()` is required precisely because a skipped `needs` would
+    # otherwise skip this job too, which is the common `nexus=false` dispatch.
+    needs: [build-ue-test, nexus-package]
+    if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true' && needs.build-ue-test.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged addon
+        uses: actions/download-artifact@v4
+        with:
+          name: Luma-Snowbreak
+          path: dist
+
+      # Only exists when the "nexus" input was left checked. continue-on-error keeps an
+      # ordinary release working when it was not.
+      - name: Download Nexus package
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: Luma-Snowbreak-Nexus
+          path: dist
+
+      - name: Inspect payload
+        run: ls -l dist
+
+      # Fail closed. The `continue-on-error` on the download above is what keeps an ordinary
+      # (nexus=false) dispatch working, and it is also exactly what hid the missing artifact
+      # in run 35239084950 - so when the Nexus package was requested, assert it is here.
+      - name: Verify the Nexus package is present when requested
+        if: github.event.inputs.nexus == 'true'
+        shell: bash
+        run: |
+          if ! ls dist/*Nexus*.zip >/dev/null 2>&1; then
+            echo "::error::nexus=true but dist/ holds no Nexus package - refusing to publish a release whose body promises two archives."
+            ls -l dist
+            exit 1
+          fi
+          ls -l dist/*Nexus*.zip
+
+      # The tag is the release version (v1.1), not the Actions run number. A run number
+      # only says "the 30th time some workflow ran": it jumps for unrelated reasons and
+      # tells a user nothing about what changed.
+      #
+      # It also keeps its own `v<version>` namespace instead of the upstream `latest-<n>`
+      # scheme: this repository still carries ~350 orphaned `latest-*` tags from earlier
+      # full-matrix runs, and reusing that namespace would make the number collide with an
+      # existing tag - action-gh-release would then attach the new release to whatever
+      # commit that old tag points at.
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          v="${{ inputs.version }}"
+          v="${v#v}"
+          if [ -z "$v" ]; then
+            echo "::error::the version input is empty - pass an explicit version"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $v as tag v$v"
+
+      # Fail closed. softprops/action-gh-release will happily move an existing tag, which
+      # would silently repoint a version that users may already have downloaded.
+      - name: Refuse to move an existing tag
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::tag ${{ steps.ver.outputs.tag }} already exists - bump the version input instead of moving a published tag"
+            exit 1
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Release ${{ steps.ver.outputs.version }}
+          body: |
+            Luma for **Snowbreak: Containment Zone** - fork build, x64 addon only.
+
+            - Version: ${{ steps.ver.outputs.version }}
+            - Built from commit ${{ github.sha }}
+            - Configuration: `Publishing-Release` / `x64`
+            - Archive contents: `Luma-Snowbreak_Containment_Zone.addon`, its `Luma/Snowbreak Containment Zone/` shader mount, and the shared runtime files
+
+            The attached archives hold the same add-on and differ only in packaging. The second
+            one is produced when the build was dispatched with the Nexus option:
+
+            - `Luma-Snowbreak_Containment_Zone.zip` - upstream-style package. Also carries ReShade as `dxgi.dll`, so it can be dropped into a game folder that has no ReShade yet.
+            - `Luma-Snowbreak-Nexus-<version>.zip` - for the Nexus upload. No `dxgi.dll` and no `nvngx_dlss.dll`, plus the licence text, a credit file and `SHA256SUMS.txt`.
+
+            Installation
+            ------------
+            1. Extract the archive directly into the game folder (the one containing the game executable), replacing the previous files when updating.
+            2. Boot the game and press `Home` to bring up the ReShade and Luma menus. If they do not appear, ReShade or Luma failed to load.
+
+            This release only contains this game's mod. It is not the full multi-game Luma package.
+          files: |
+            dist/*.zip
+          draft: false
+          prerelease: false

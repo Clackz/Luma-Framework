@@ -4,7 +4,4 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="..\..\Core\unity_build.cpp" />
   </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="includes\shader_detect.hpp" />
-  </ItemGroup>
 </Project>

@@ -21,7 +21,10 @@
 #define CHECK_GRAPHICS_API_COMPATIBILITY 1
 
 #include "..\..\Core\core.hpp"
-#include "includes\shader_detect.hpp"
+// The UE4 TAA pixel shader detection is not game specific: it lives in the Unreal
+// Engine template and is included from there instead of being duplicated here, so
+// fixes to it (e.g. the immediate constant buffer stepping) apply to every UE4 title.
+#include "..\Unreal Engine\includes\shader_detect.hpp"
 
 namespace
 {

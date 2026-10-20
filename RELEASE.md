@@ -1,6 +1,6 @@
 # 发版清单
 
-每次 dispatch `build-ue-only.yml` 发版前，逐项过一遍。这份清单存在的原因见最后一段。
+每次 dispatch `build.yml` 发版前，逐项过一遍。这份清单存在的原因见最后一段。
 
 ## 1. 对外文案（最容易过期，最先查）
 
@@ -21,11 +21,11 @@
 ## 3. 构建
 
 ```
-gh workflow run build-ue-only.yml --repo Clackz/Luma-Framework --ref main \
+gh workflow run build.yml --repo Clackz/Luma-Framework --ref main \
   -f release=true -f nexus=true -f version=<X.Y>
 ```
 
-- [ ] `Build UE Mod Only` 与 `Build Nexus Package` 两个 job 全绿。
+- [ ] `Build (Publishing-Release)` 与 `Build Nexus Package` 两个 job 全绿。
 - [ ] 两个 artifact 都在：`Luma-Snowbreak`（上游式包）与 `Luma-Snowbreak-Nexus`（N 网包）。
 
 ## 4. 本地部署实测
@@ -62,7 +62,7 @@ apikey: <个人 API key>
 2026-10-07 发 1.2 时发现：包内 README 和 N 网说明页都还写着 1.0 时代的
 「HDR 重制在本版本已关闭」，而 HDR 从 1.1 就已经重开了 —— 错了整整两个版本没人察觉。
 
-根因是 README 当时内联在 `build-ue-only.yml` 的 PowerShell here-string 里，发版时根本看不到它，
+根因是 README 当时内联在 `build.yml` 的 PowerShell here-string 里，发版时根本看不到它，
 diff 也容易被忽略。现在改成了：
 
 - README 外置成 `Scripts/Nexus-README.txt`，改它就是一次普通的文件 diff；

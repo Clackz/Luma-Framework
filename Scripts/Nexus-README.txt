@@ -25,6 +25,15 @@ Contents
 Requirements
 ------------
 ReShade 6.x or newer, with add-on support, must already be installed for the game.
+
+A DLSS runtime, nvngx_dlss.dll (310.x), must also sit next to Game.exe. The game
+ships without one, so a game folder that never had DLSS installed has nothing for
+DLSS to load - and without it the "DLSS" entry in the Super Resolution dropdown is
+greyed out and cannot be selected. This archive does not include that file. If you
+need one, take it from the official Luma release for this game (the nvngx_dlss.dll
+at the root of its archive - do not take its dxgi.dll, that one would replace your
+ReShade), or let DLSS Swapper put a current runtime in for you.
+
 This archive deliberately does NOT contain ReShade. ReShade loads from a fixed slot,
 usually dxgi.dll, and that slot may already be taken by an existing ReShade install
 or by another tool such as OptiScaler. Writing our own copy there would silently
@@ -47,6 +56,9 @@ Installation
 
 Notes
 -----
+* If the "DLSS" entry in the Super Resolution dropdown is greyed out, the DLSS
+  runtime is missing - see Requirements above. Add nvngx_dlss.dll next to Game.exe
+  and restart the game.
 * Luma's HDR remastering is enabled on HDR displays by default. Untick
   "Enable Luma HDR" in the Luma tab once if you want SDR output. Leaving a
   stage and returning to the main lobby could once leave the loading screen
@@ -86,7 +98,7 @@ DLSS 超分。它基于 Luma Framework，以 ReShade 插件的形式运行，本
 --------
   Luma-Snowbreak Containment Zone.addon
       mod 本体
-  Luma/Global/ 、Luma/Includes/ 、Luma/Snowbreak Containment Zone/
+  Luma/Global/ 、 Luma/Includes/ 、 Luma/Snowbreak Containment Zone/
       mod 运行时挂载的着色器
   Luma/d3dcompiler_47.dll
       mod 运行时使用的着色器编译器
@@ -99,9 +111,16 @@ DLSS 超分。它基于 Luma Framework，以 ReShade 插件的形式运行，本
 
 前置要求
 --------
-需先为游戏装好 ReShade 6.x 或更新版本（带 add-on 支持）。本 mod 不含 ReShade。
-ReShade 从固定槽位加载（通常是 dxgi.dll），该槽位可能已被你现有的 ReShade
-或 OptiScaler 之类工具占用，写入我们自己的副本会覆盖掉你原本能用的那份。
+需先为游戏装好 ReShade 6.x 或更新版本（带 add-on 支持）。
+
+还需在 Game.exe 旁边放一份 DLSS 运行时 nvngx_dlss.dll（310.x）。游戏本体不带这个
+文件，从未装过 DLSS 的目录里没有任何可供 DLSS 加载的东西——缺了它，Super Resolution
+下拉框中的 DLSS 一项会变成灰色不可选。本包不含该文件。需要的话，可从本游戏的 Luma
+官方发布包中取根目录那份 nvngx_dlss.dll（**不要取它里面的 dxgi.dll**，那个会顶掉你
+现有的 ReShade），或用 DLSS Swapper 放入一份当前版本的运行时。
+
+本包不含 ReShade。ReShade 从固定槽位加载（通常是 dxgi.dll），该槽位可能已被你现有的
+ReShade 或 OptiScaler 之类工具占用，写入我们自己的副本会覆盖掉你原本能用的那份。
 
 安装
 ----
@@ -118,6 +137,8 @@ ReShade 从固定槽位加载（通常是 dxgi.dll），该槽位可能已被你
 
 注意事项
 --------
+* 若 Super Resolution 下拉框中 DLSS 一项为灰色不可选，说明缺少 DLSS 运行时——见
+  上文「前置要求」。把 nvngx_dlss.dll 放到 Game.exe 旁边并重启游戏即可。
 * Luma 的 HDR 重制在 HDR 显示器上默认开启。需要 SDR 输出的话，在 Luma
   标签页里取消勾选 "Enable Luma HDR" 一次即可。开启时退出副本回到主界面
   曾可能一直卡在加载界面——游戏本身仍在满帧运行，但加载界面不消失；该问题

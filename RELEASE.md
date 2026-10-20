@@ -6,6 +6,9 @@
 
 - [ ] `Scripts/Nexus-README.txt` — 打进 Nexus 包的 README。逐条核对：功能描述、已知问题、
       HDR 状态、安装步骤，是否还和**这一版**的实际行为一致。
+- [ ] `Scripts/Full-README.txt` — 打进完整包（含 ReShade / `nvngx_dlss.dll`）的 README。
+      两份要一起改：完整包那份多了「会覆盖已有 `dxgi.dll` 与 `nvngx_dlss.dll`」的警告和
+      NVIDIA 署名，精简包那份则强调不含这两个文件。**只改一份 = 另一份从发布那一刻起就是错的。**
 - [ ] N 网说明页（description）+ 页面 summary — 口径要和上面的 README 一致。
       改法见文末「改 N 网说明页」。
 - [ ] GitHub Release 的 body / changelog — 写清这一版改了什么。
@@ -26,7 +29,10 @@ gh workflow run build.yml --repo Clackz/Luma-Framework --ref main \
 ```
 
 - [ ] `Build (Publishing-Release)` 与 `Build Nexus Package` 两个 job 全绿。
-- [ ] 两个 artifact 都在：`Luma-Snowbreak`（上游式包）与 `Luma-Snowbreak-Nexus`（N 网包）。
+- [ ] 两个 artifact 都在：`Luma-Snowbreak`（完整包 `Luma-Snowbreak-<X.Y>.zip`）与
+      `Luma-Snowbreak-Nexus`（N 网包 `Luma-Snowbreak-Nexus-<X.Y>.zip`）。
+- [ ] 两个包内都有 `LICENSE.md` / `README.txt` / `build-info.txt` / `SHA256SUMS.txt`，
+      且 `build-info.txt` 里的 version 就是这一版（CI 自动写，不需要手工补）。
 
 ## 4. 本地部署实测
 
@@ -65,6 +71,6 @@ apikey: <个人 API key>
 根因是 README 当时内联在 `build.yml` 的 PowerShell here-string 里，发版时根本看不到它，
 diff 也容易被忽略。现在改成了：
 
-- README 外置成 `Scripts/Nexus-README.txt`，改它就是一次普通的文件 diff；
-- 每次打包都会把 README 全文打到构建日志里，发版时抬头就能看见；
+- README 外置成 `Scripts/Nexus-README.txt` 与 `Scripts/Full-README.txt`，改它就是一次普通的文件 diff；
+- 每次打包都会把 README 全文打到构建日志里（`Scripts/package-metadata.ps1`），发版时抬头就能看见；
 - 这份清单把「查文案」放进了发版流程的第一步。

@@ -611,7 +611,7 @@ jobs:
 
             Installation
             ------------
-            1. Extract the archive directly into the game folder (the one containing the game executable), replacing the previous files when updating.
+            1. Extract the archive into the folder holding `Game.exe` - not the install folder the launcher shows, but the one below it: `<install folder>\data\game\Game\Binaries\Win64`. Replace the previous files when updating.
             2. Boot the game and press `Home` to bring up the ReShade and Luma menus. If they do not appear, ReShade or Luma failed to load.
 
             This release only contains this game's mod. It is not the full multi-game Luma package.

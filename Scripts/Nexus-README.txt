@@ -33,8 +33,15 @@ overwrite whatever the user already has working.
 Installation
 ------------
 1. Confirm the ReShade overlay opens in game (Home key).
-2. Extract this archive into the folder that holds the game executable, merging
-   folders and replacing files when updating.
+2. Extract this archive into the folder that holds Game.exe. That is NOT the
+   install folder your launcher shows you - it sits several levels below it:
+
+       <install folder>                              e.g. D:\Program Files\Snow
+       <install folder>\data\game\Game\Binaries\Win64   <- Game.exe, extract here
+
+   Merge folders and replace files when updating. If you extract into the install
+   folder instead, the mod ends up next to the launcher rather than next to the
+   game and nothing will load.
 3. Launch the game and press Home. The add-on list should now contain Luma.
 4. Open the Luma tab and set Super Resolution to DLSS.
 
@@ -99,7 +106,13 @@ ReShade 从固定槽位加载（通常是 dxgi.dll），该槽位可能已被你
 安装
 ----
 1. 确认游戏内按 Home 能呼出 ReShade 面板。
-2. 将本压缩包解压到游戏可执行文件所在目录，合并文件夹，更新时覆盖。
+2. 解压到 Game.exe 所在目录。注意不是启动器所显示的那个安装目录——它在下面好几层：
+
+       <安装目录>                                    例如 D:\Program Files\Snow
+       <安装目录>\data\game\Game\Binaries\Win64\     ← Game.exe 在这里，解压到这一层
+
+   合并文件夹，更新时覆盖。如果解压到安装目录，mod 会落在启动器旁边而不是游戏旁边，
+   什么都不会加载。
 3. 启动游戏并按 Home，插件列表中应出现 Luma。
 4. 打开 Luma 标签页，将 Super Resolution 设为 DLSS。
 
